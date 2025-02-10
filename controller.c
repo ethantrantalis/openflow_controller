@@ -1,18 +1,4 @@
-/* OpenFlow Controller - Milestone 1 
- * CPE 465 - Winter 2025
- * 
- * Essentially the flow of the controller works as follows:
- * 1. A socket is spawned and listens for incoming connections from switches on TCP. 
- * A thread is spawned that continuously listens for new connections using this socket and handles
- * new connections by spawning a new thread for each switch connection.
- * 2. The controller sends a HELLO message to the switch and waits for a HELLO message in return.
- * 3. The controller sends a FEATURES_REQUEST message to the switch and waits for a FEATURES_REPLY message.
- * 4. The controller then waits for incoming messages from the switch and processes them accordingly.
- * 5. The controller can handle multiple switches at once up to 16.
- * 
- * 
- * 
- * 
+/* 
  * sudo mn --controller=remote,ip=127.0.0.1,port=6653 --switch=ovsk,protocols=OpenFlow13
  */
 
@@ -26,6 +12,16 @@
 #include <arpa/inet.h>
 #include <signal.h>
 #include <pthread.h>
+#include <inttypes.h>
+#include <stdarg.h>
+
+#if defined(__linux__)
+    #include <endian.h>
+#elif defined(__APPLE__)
+    #include <libkern/OSByteOrder.h>
+    #define be64toh(x) OSSwapBigToHostInt64(x)
+#endif
+
 #include "controller.h"
 #include "openflow.h"
 
@@ -35,8 +31,6 @@ void signal_handler(int signum) {
     printf("\nShutdown signal received, cleaning up...\n");
     running = 0;
 }
-
-
 
 /* thread-safe logging function */
 void log_msg(const char *format, ...) {
@@ -76,7 +70,22 @@ int main(int argc, char *argv[]) {
     }
     
     /* cleanup */
-    cleanup();
+    for (int i = 0; i < MAX_SWITCHES; i++) {
+        pthread_mutex_lock(&switches[i].lock);
+        if (switches[i].active) {
+            switches[i].active = 0;
+            close(switches[i].socket);
+            free(switches[i].ports);
+        }
+        pthread_mutex_unlock(&switches[i].lock);
+        pthread_mutex_destroy(&switches[i].lock);
+    }
+    
+    /* Close server socket */
+    close(server_socket);
+    
+    /* Destroy global mutex */
+    pthread_mutex_destroy(&switches_lock);
     return 0;
 }
 
@@ -185,25 +194,32 @@ void *accept_handler(void *arg) {
 /* handler for each connected switch, manages the lifecycle of a connection  */
 void *switch_handler(void *arg) {
     struct switch_info *sw = (struct switch_info *)arg;
-    uint8_t buf[OFP_MAX_MSG_SIZE]; /* buffer for incoming messages */
+    uint8_t buf[OFP_MAX_MSG_SIZE];
+    
+    /* initialize switch state */
+    sw->hello_received = 0;
     
     /* start OpenFlow handshake with HELLO message */
     send_hello(sw);
     
-    /* message handling loop */
+    /* message handling loop, waiting for hello */
     while (sw->active && running) {
-        /* receive message */
         ssize_t len = recv(sw->socket, buf, sizeof(buf), 0);
-        if (len <= 0) {     /* connection closed or error */
+        if (len <= 0) {
             if (len < 0) perror("Receive failed");
             break;
         }
         
         /* process message */
         handle_switch_message(sw, buf, len);
+        
+        /* check if we need to disconnect due to version mismatch */
+        if (!sw->active) {
+            break;
+        }
     }
     
-    /* clean up connection once switch has left */
+    /* clean up connection */
     pthread_mutex_lock(&sw->lock);
     if (sw->active) {
         sw->active = 0;
@@ -263,11 +279,13 @@ void handle_switch_message(struct switch_info *sw, uint8_t *msg, size_t len) {
             break;
             
         case OFPT_PACKET_IN:
-            handle_packet_in(sw, (struct ofp_packet_in *)msg);
+            /* handle_packet_in(sw, (struct ofp_packet_in *)msg); */
+            log_msg("Packet in received from switch %016" PRIx64 "\n", sw->datapath_id);
             break;
             
         case OFPT_PORT_STATUS:
-            handle_port_status(sw, (struct ofp_port_status *)msg);
+            /* handle_port_status(sw, (struct ofp_port_status *)msg); */
+            log_msg("Port status change on switch %016" PRIx64 "\n", sw->datapath_id);
             break;
             
         default:
@@ -278,13 +296,27 @@ void handle_switch_message(struct switch_info *sw, uint8_t *msg, size_t len) {
 /* handle HELLO message */
 void handle_hello(struct switch_info *sw, struct ofp_header *oh) {
     sw->version = oh->version;
+    sw->hello_received = 1;  /* mark HELLO as received */
     log_msg("Switch hello received, version 0x%02x\n", sw->version);
     
-    /* request switch features once a hello response has been recieved*/
-    send_features_request(sw);
+    /* Only send features request after HELLO exchange is complete */
+    if (sw->version == OFP_VERSION) {
+        send_features_request(sw);
+    } else {
+        /* Version mismatch - should send error */
+        struct ofp_error_msg error;
+        error.header.version = OFP_VERSION;
+        error.header.type = OFPT_ERROR;
+        error.header.length = htons(sizeof(error));
+        error.header.xid = oh->xid;
+        error.type = htons(OFPET_HELLO_FAILED);
+        error.code = htons(OFPHFC_INCOMPATIBLE);
+        send_openflow_msg(sw, &error, sizeof(error));
+        sw->active = 0;  /* Mark for disconnection */
+    }
 }
 
-/* Send features request */
+/* send features request */
 void send_features_request(struct switch_info *sw) {
     struct ofp_header freq;
     
@@ -296,17 +328,16 @@ void send_features_request(struct switch_info *sw) {
     send_openflow_msg(sw, &freq, sizeof(freq));
 }
 
-/* Handle features reply */
-/* Handle features reply for OpenFlow 1.0 */
+/* handle features reply */
 void handle_features_reply(struct switch_info *sw, struct ofp_switch_features *features) {
     sw->datapath_id = be64toh(features->datapath_id);
     sw->n_tables = features->n_tables;
     
-    /* Calculate number of ports */
+    /* calculate number of ports */
     size_t port_list_len = ntohs(features->header.length) - sizeof(*features);
     int num_ports = port_list_len / sizeof(struct ofp_phy_port);
     
-    /* Store port information */
+    /* store port information */
     sw->ports = malloc(port_list_len);
     if (sw->ports) {
         memcpy(sw->ports, features->ports, port_list_len);
@@ -320,7 +351,7 @@ void handle_features_reply(struct switch_info *sw, struct ofp_switch_features *f
     log_msg("  Number of buffers: %d\n", ntohl(features->n_buffers));
     log_msg("  Number of ports: %d\n", num_ports);
     
-    /* Print capabilities */
+    /* print capabilities for debugging purposes */
     log_msg("  Capabilities:\n");
     uint32_t capabilities = ntohl(features->capabilities);
     if (capabilities & OFPC_FLOW_STATS)    log_msg("    - Flow statistics\n");
@@ -331,7 +362,7 @@ void handle_features_reply(struct switch_info *sw, struct ofp_switch_features *f
     if (capabilities & OFPC_QUEUE_STATS)   log_msg("    - Queue statistics\n");
     if (capabilities & OFPC_ARP_MATCH_IP)  log_msg("    - ARP match IP\n");
     
-    /* Print ports */
+    /* Print ports for debugging purposes */
     for (int i = 0; i < num_ports; i++) {
         struct ofp_phy_port *port = &sw->ports[i];
         log_msg("\nPort %d:\n", ntohs(port->port_no));
@@ -340,13 +371,13 @@ void handle_features_reply(struct switch_info *sw, struct ofp_switch_features *f
                 port->hw_addr[0], port->hw_addr[1], port->hw_addr[2],
                 port->hw_addr[3], port->hw_addr[4], port->hw_addr[5]);
         
-        /* Print port state */
+        /* print port state */
         if (ntohl(port->state) & OFPPS_LINK_DOWN)
             log_msg("  State: Link down\n");
         else
             log_msg("  State: Link up\n");
             
-        /* Print port features */
+        /* print port features */
         uint32_t curr = ntohl(port->curr);
         log_msg("  Current features:\n");
         if (curr & OFPPF_10MB_HD)    log_msg("    - 10Mb half-duplex\n");

@@ -36,6 +36,7 @@ struct switch_info {
     uint32_t port_changes;     /* Number of port changes */
     
     pthread_mutex_t lock;      /* thread safety */
+    int hello_received;     /* track if HELLO was received */
 };
 
 /* global variables */
@@ -45,17 +46,16 @@ int server_socket;
 volatile int running = 1; /* for controller clean up and running */
 
 /* function prototypes */
-void init_controller(int port);
-void *switch_handler(void *arg);
-void handle_switch_message(struct switch_info *sw, uint8_t *msg, size_t len);
+void signal_handler(int signum); 
+void log_msg(const char *format, ...); 
+int main(int argc, char *argv[]);
+void init_controller(int port); 
+void *accept_handler(void *arg); 
+void *switch_handler(void *arg); 
 void send_hello(struct switch_info *sw);
-void send_features_request(struct switch_info *sw);
+void send_openflow_msg(struct switch_info *sw, void *msg, size_t len);
+void handle_switch_message(struct switch_info *sw, uint8_t *msg, size_t len);
 void handle_hello(struct switch_info *sw, struct ofp_header *oh);
-void handle_features_reply(struct switch_info *sw, struct ofp_switch_features *features);
-void handle_packet_in(struct switch_info *sw, struct ofp_packet_in *pi);
-void handle_port_status(struct switch_info *sw, struct ofp_port_status *ps);
-void print_switch_info(struct switch_info *sw);
-void cleanup(void);
-
-
+void send_features_request(struct switch_info *sw);
+void handle_features_reply(struct switch_info *sw, struct ofp_switch_features *features); 
 #endif
