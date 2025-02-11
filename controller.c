@@ -49,7 +49,8 @@
 * 8. The send_echo_request function sends an ECHO_REQUEST to the switch.
 *  - The function creates an ECHO_REQUEST message and sends it to the switch.
 */
-
+#include "smartalloc.h"
+#include "checksum.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -64,6 +65,8 @@
 #include <stdarg.h>
 #include <netinet/tcp.h>
 #include <stdbool.h>
+#include <sys/time.h>
+#include <time.h>
 
 #if defined(__linux__)
     #include <endian.h>
@@ -85,12 +88,26 @@ void signal_handler(int signum) {
 /* thread-safe logging function */
 void log_msg(const char *format, ...) {
     va_list args;
-    va_start(args, format);      /* initialize variatric args starting at format */
-    pthread_mutex_lock(&switches_lock);      /* lock to prevent other threads from writing */
+    va_start(args, format);
+    
+    pthread_mutex_lock(&switches_lock);
+    
+    // Get current time with microsecond precision
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    struct tm *tm_info = localtime(&tv.tv_sec);
+    
+    // Print timestamp in HH:MM:SS.microseconds format
+    printf("[%02d:%02d:%02d.%06ld] ", 
+           tm_info->tm_hour,
+           tm_info->tm_min, 
+           tm_info->tm_sec,
+           (long)tv.tv_usec);
+    
     vprintf(format, args);
-    fflush(stdout);      /* clear out buffered output */
+    fflush(stdout);
     pthread_mutex_unlock(&switches_lock);
-    va_end(args);      /* cleans up args*/
+    va_end(args);
 }
 
 /* clean up function for threads and and switches*/
@@ -274,50 +291,73 @@ void *switch_handler(void *arg) {
     struct switch_info *sw = (struct switch_info *)arg;
     uint8_t buf[OFP_MAX_MSG_SIZE];
     ssize_t len;
-    time_t next_echo = time(NULL) + ECHO_INTERVAL;
+    time_t next_echo = 0;
+    time_t now;
     
     printf("Switch handler started for new connection\n");
     
     /* initialize switch state */
     sw->hello_received = 0;
     sw->features_received = 0;
+    sw->last_echo_xid = 0;
+    sw->echo_pending = false;
     
     /* start OpenFlow handshake */
     send_hello(sw);
     
     /* message handling loop */
     while (sw->active && running) {
-        len = recv(sw->socket, buf, sizeof(buf), 0);
+        struct timeval tv;
+        tv.tv_sec = 1; 
+        tv.tv_usec = 0;
         
-        if (len == 0) {
-            log_msg("Connection closed cleanly by switch %016" PRIx64 "\n", sw->datapath_id);
-            break;
-        } else if (len < 0) {
-            if (errno == EINTR) {
-                continue; 
-            } else if (errno == ECONNRESET) {
-                log_msg("Connection reset by switch %016" PRIx64 "\n", sw->datapath_id);
-            } else {
-                log_msg("Receive error on switch %016" PRIx64 ": %s\n", 
-                        sw->datapath_id, strerror(errno));
+        fd_set readfds;
+        FD_ZERO(&readfds);
+        FD_SET(sw->socket, &readfds);
+        
+        int ret = select(sw->socket + 1, &readfds, NULL, NULL, &tv);
+        
+        now = time(NULL);
+        
+        /* handle echo timing independent of message receipt */
+        if (sw->features_received) {
+            if (next_echo == 0) {
+                next_echo = now + ECHO_INTERVAL;
             }
-            break;
+            
+            if (sw->echo_pending && (now - sw->last_echo) > ECHO_TIMEOUT) {
+                sw->echo_pending = false;
+            }
+            
+            if (!sw->echo_pending && now >= next_echo) {
+                if (send_echo_request(sw)) {
+                    next_echo = now + ECHO_INTERVAL;
+                }
+            }
         }
         
-        /* process message */
-        handle_switch_message(sw, buf, len);
-        
-        /* keep connection alive with echo requests */
-        if (sw->features_received) {
-            time_t now = time(NULL);
-            if (now >= next_echo) {
-                if (sw->echo_pending && (now - sw->last_echo) > ECHO_TIMEOUT) {
-                    /* echo reply timeout - reset pending flag */
-                    sw->echo_pending = false;
+        /* handle incoming messages if any */
+        if (ret > 0 && FD_ISSET(sw->socket, &readfds)) {
+            len = recv(sw->socket, buf, sizeof(buf), 0);
+            if (len == 0) {
+                log_msg("Connection closed cleanly by switch %016" PRIx64 "\n", 
+                       sw->datapath_id);
+                break;
+            } else if (len < 0) {
+                if (errno == EINTR) {
+                    continue;
+                } else if (errno == ECONNRESET) {
+                    log_msg("Connection reset by switch %016" PRIx64 "\n", 
+                           sw->datapath_id);
+                } else {
+                    log_msg("Receive error on switch %016" PRIx64 ": %s\n",
+                           sw->datapath_id, strerror(errno));
                 }
-                send_echo_request(sw);
-                next_echo = now + ECHO_INTERVAL;  /* schedule next echo */
+                break;
             }
+            
+            /* process message */
+            handle_switch_message(sw, buf, len);
         }
     }
     
@@ -407,7 +447,7 @@ void handle_hello(struct switch_info *sw, struct ofp_header *oh) {
 void handle_echo_request(struct switch_info *sw, struct ofp_header *oh) {
     struct ofp_header echo;
     
-    /* Simply change the type to reply and send it back */
+    /* simply change the type to reply and send it back */
     memcpy(&echo, oh, sizeof(echo));
     echo.type = OFPT_ECHO_REPLY;
     
@@ -529,8 +569,7 @@ void handle_echo_reply(struct switch_info *sw, struct ofp_header *oh) {
     
     /* update both last reply and last echo time */
     sw->last_echo_reply = time(NULL);
-    sw->last_echo = sw->last_echo_reply;
-    sw->echo_pending = false;  // Mark that we can send another echo
+    sw->echo_pending = false;  /* Mark that anothe echo can be send, meaning echos have vbeen recienved */
 
     /* for debugging */
     log_msg("Echo reply received from switch %016" PRIx64 " (XID: %u)\n", 
@@ -639,20 +678,36 @@ void send_hello(struct switch_info *sw) {
 }
 
 /* add echo request/reply support */
-void send_echo_request(struct switch_info *sw) {
+bool send_echo_request(struct switch_info *sw) {
 
-    /* only send if not waiting for a reply */
     if (!sw->echo_pending) {
         struct ofp_header echo;
         
         echo.version = OFP_VERSION;
         echo.type = OFPT_ECHO_REQUEST;
         echo.length = htons(sizeof(echo));
-        echo.xid = htonl(sw->last_echo_xid);
+        echo.xid = htonl(sw->last_echo_xid++);
         
         sw->echo_pending = true;
-        send_openflow_msg(sw, &echo, sizeof(echo));
+        
+        pthread_mutex_lock(&sw->lock);
+        bool success = false;
+        sw->last_echo = time(NULL);
+        if (sw->active) {
+            success = (send(sw->socket, &echo, sizeof(echo), 0) >= 0);
+            if (!success) {
+                sw->echo_pending = false;  /* reset if send failed */
+            }
+
+            log_msg("Echo request sent to switch %016" PRIx64 " (XID: %u)\n", 
+                    sw->datapath_id, ntohl(echo.xid));
+        }
+        pthread_mutex_unlock(&sw->lock);
+        
+        return success;
     }
+    log_msg("Echo request already pending for switch %016" PRIx64 "\n", sw->datapath_id);
+    return false;
 }
 
 /* send features request */

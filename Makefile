@@ -1,25 +1,28 @@
 # Compiler and flags
 CC = gcc
-CFLAGS = -Wall -g
+CFLAGS = -Wall -Werror -g
 LDFLAGS = -pthread
 
 # Target executable
 TARGET = controller
 
 # Source files and headers
-SRCS = controller.c
+SRCS = controller.c checksum.c smartalloc.c
 HDRS = controller.h openflow.h
+
+# Object files
+OBJS = controller.o checksum.o smartalloc.o
 
 # Default target
 all: $(TARGET)
 
 # Link the executable
-$(TARGET): controller.o
-	$(CC) controller.o -o $(TARGET) $(LDFLAGS)
+$(TARGET): $(OBJS)
+	$(CC) $(OBJS) -o $(TARGET) $(LDFLAGS)
 
 # Compile source files
-controller.o: $(SRCS) $(HDRS)
-	$(CC) $(CFLAGS) -c $(SRCS)
+%.o: %.c $(HDRS)
+	$(CC) $(CFLAGS) -c $< -o $@
 
 # Clean up
 clean:

@@ -1,6 +1,8 @@
 #ifndef CONTROLLER_H
 #define CONTROLLER_H
 
+#include "smartalloc.h"
+#include "checksum.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -70,7 +72,7 @@ void send_features_request(struct switch_info *sw);
 void handle_features_reply(struct switch_info *sw, struct ofp_switch_features *features); 
 void handle_packet_in(struct switch_info *sw, struct ofp_packet_in *pi);
 void handle_echo_request(struct switch_info *sw, struct ofp_header *oh);
-void send_echo_request(struct switch_info *sw);
+bool send_echo_request(struct switch_info *sw);
 void handle_echo_reply(struct switch_info *sw, struct ofp_header *oh);
 void handle_port_status(struct switch_info *sw, struct ofp_port_status *ps);
 void cleanup_switch(struct switch_info *sw);
