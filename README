@@ -1,0 +1,5 @@
+Ethan Trantalis (etrantal)
+
+command used for testing in MiniNet
+
+sudo mn --controller=remote,ip=<IP ADDRESS>,port=6633 --switch=ovsk,protocols=OpenFlow10

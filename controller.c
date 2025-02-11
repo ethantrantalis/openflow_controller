@@ -1,5 +1,5 @@
 /* 
- * sudo mn --controller=remote,ip=IP,port=6633 --switch=ovsk,protocols=OpenFlow13
+ * sudo mn --controller=remote,ip=IP,port=6633 --switch=ovsk,protocols=OpenFlow10
  */
 
 /*
@@ -68,6 +68,8 @@
 #include <sys/time.h>
 #include <time.h>
 
+
+
 #if defined(__linux__)
     #include <endian.h>
 #elif defined(__APPLE__)
@@ -128,13 +130,25 @@ void cleanup_switch(struct switch_info *sw) {
 /* main controller function */
 int main(int argc, char *argv[]) {
     int port = OFP_TCP_PORT;
+
+    if (argc == 1) {
+        /* handle command line args for port number */
+        fprintf(stderr, "Usage: %s [debug 0/1] [port]\n", argv[0]);
+        return -1;
+    } else if (argc > 1) {
+        /* handle command line args for port number */
+        int debug = atoi(argv[1]);
+        if(debug){
+            #define DEBUG
+        }
+        if (argc > 2) {
+            /* convert second arg to int for port from user */
+            port = atoi(argv[2]);
+        }
+    }
     
     /* handle command line args for port number */
-    if (argc > 1) {
-
-        /* convert second arg to int for port from user */
-        port = atoi(argv[1]);
-    }
+    
     
     /* set up signal handling */
     signal(SIGINT, signal_handler);
@@ -456,6 +470,15 @@ void handle_echo_request(struct switch_info *sw, struct ofp_header *oh) {
 
 /* handle features reply */
 void handle_features_reply(struct switch_info *sw, struct ofp_switch_features *features) {
+    pthread_mutex_lock(&sw->lock);
+    
+    /* clean up any existing port data */
+    if (sw->ports) {
+        free(sw->ports);
+        sw->ports = NULL;
+        sw->num_ports = 0;
+    }
+
     sw->datapath_id = be64toh(features->datapath_id);
     sw->n_tables = features->n_tables;
     
@@ -463,21 +486,31 @@ void handle_features_reply(struct switch_info *sw, struct ofp_switch_features *f
     size_t port_list_len = ntohs(features->header.length) - sizeof(*features);
     int num_ports = port_list_len / sizeof(struct ofp_phy_port);
     
+    log_msg("Received features reply from switch %016" PRIx64 "\n", sw->datapath_id);
+    
     /* store port information */
     sw->ports = malloc(port_list_len);
-    if (sw->ports) {
-        memcpy(sw->ports, features->ports, port_list_len);
-        sw->num_ports = num_ports;
+    if (!sw->ports) {
+        log_msg("Error: Failed to allocate memory for ports\n");
+        pthread_mutex_unlock(&sw->lock);
+        return;
     }
     
+    memcpy(sw->ports, features->ports, port_list_len);
+    sw->num_ports = num_ports;
+    
+    /* mark features as received */
+    sw->features_received = 1;
+    
+    /* log switch features */
     log_msg("\nSwitch features:\n");
     log_msg("  Datapath ID: %016" PRIx64 "\n", sw->datapath_id);
     log_msg("  OpenFlow version: 0x%02x\n", sw->version);
     log_msg("  Number of tables: %d\n", sw->n_tables);
     log_msg("  Number of buffers: %d\n", ntohl(features->n_buffers));
     log_msg("  Number of ports: %d\n", num_ports);
-    
-    /* print capabilities for debugging purposes */
+
+    /* print capabilities */
     log_msg("  Capabilities:\n");
     uint32_t capabilities = ntohl(features->capabilities);
     if (capabilities & OFPC_FLOW_STATS)    log_msg("    - Flow statistics\n");
@@ -488,7 +521,7 @@ void handle_features_reply(struct switch_info *sw, struct ofp_switch_features *f
     if (capabilities & OFPC_QUEUE_STATS)   log_msg("    - Queue statistics\n");
     if (capabilities & OFPC_ARP_MATCH_IP)  log_msg("    - ARP match IP\n");
     
-    /* Print ports for debugging purposes */
+    /* print port details */
     for (int i = 0; i < num_ports; i++) {
         struct ofp_phy_port *port = &sw->ports[i];
         log_msg("\nPort %d:\n", ntohs(port->port_no));
@@ -519,6 +552,8 @@ void handle_features_reply(struct switch_info *sw, struct ofp_switch_features *f
         if (curr & OFPPF_PAUSE)      log_msg("    - Pause\n");
         if (curr & OFPPF_PAUSE_ASYM) log_msg("    - Asymmetric pause\n");
     }
+    
+    pthread_mutex_unlock(&sw->lock);
 }
 
 /* handle incoming packets from the switch */
@@ -572,8 +607,7 @@ void handle_echo_reply(struct switch_info *sw, struct ofp_header *oh) {
     sw->echo_pending = false;  /* Mark that anothe echo can be send, meaning echos have vbeen recienved */
 
     /* for debugging */
-    log_msg("Echo reply received from switch %016" PRIx64 " (XID: %u)\n", 
-            sw->datapath_id, ntohl(oh->xid));
+    
     
     pthread_mutex_unlock(&sw->lock);
 }
@@ -586,6 +620,13 @@ void handle_port_status(struct switch_info *sw, struct ofp_port_status *ps) {
     }
 
     pthread_mutex_lock(&sw->lock);
+
+    /* only process if features have been recieved */
+    if (!sw->features_received || sw->datapath_id == 0) {
+        log_msg("Warning: Received port status before features reply\n");
+        pthread_mutex_unlock(&sw->lock);
+        return;
+    }
     
     /* increment port change counter */
     sw->port_changes++;
@@ -699,8 +740,7 @@ bool send_echo_request(struct switch_info *sw) {
                 sw->echo_pending = false;  /* reset if send failed */
             }
 
-            log_msg("Echo request sent to switch %016" PRIx64 " (XID: %u)\n", 
-                    sw->datapath_id, ntohl(echo.xid));
+            
         }
         pthread_mutex_unlock(&sw->lock);
         

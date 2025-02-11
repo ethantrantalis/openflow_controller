@@ -37,18 +37,20 @@ struct switch_info {
     struct ofp_phy_port *ports;     /* array of ports */
     int num_ports;             /* number of ports */
     
-    /* Statistics/Monitoring */
+    /* statistics/Monitoring */
     uint32_t packet_in_count;  /* number of packet-ins */
     uint32_t port_changes;     /* Number of port changes */
     
     pthread_mutex_t lock;      /* thread safety */
     int hello_received;     /* track if HELLO was received */
-    int features_received;  // Track FEATURES_REPLY receipt
-    time_t last_echo;      // Last echo request sent
-    time_t last_echo_reply; // Last echo reply received
+    bool features_received;  /* track FEATURES_REPLY receipt */
+    bool ports_initialized;
+    time_t last_echo;      /* last echo request sent */
+    time_t last_echo_reply; /* last echo reply received */
     uint32_t echo_xid; 
-    uint32_t last_echo_xid;     // Last XID sent
-    bool echo_pending;          // Whether we're waiting for a reply
+    uint32_t last_echo_xid;     /* last XID sent */
+    bool echo_pending;          /* whether we're waiting for a reply */
+    
 };
 
 /* global variables */
