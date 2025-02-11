@@ -1,5 +1,5 @@
 /* 
- * sudo mn --controller=remote,ip=127.0.0.1,port=6653 --switch=ovsk,protocols=OpenFlow13
+ * sudo mn --controller=remote,ip=IP,port=6633 --switch=ovsk,protocols=OpenFlow13
  */
 
 #include <stdio.h>
@@ -14,6 +14,7 @@
 #include <pthread.h>
 #include <inttypes.h>
 #include <stdarg.h>
+#include <netinet/tcp.h>
 
 #if defined(__linux__)
     #include <endian.h>
@@ -43,6 +44,21 @@ void log_msg(const char *format, ...) {
     va_end(args);      /* cleans up args*/
 }
 
+/* clean up function for threads and and switches*/
+void cleanup_switch(struct switch_info *sw) {
+    pthread_mutex_lock(&sw->lock);
+    if (sw->active) {
+        sw->active = 0;
+        close(sw->socket);
+        free(sw->ports);
+        sw->ports = NULL;
+        sw->num_ports = 0;
+        sw->hello_received = 0;
+        sw->features_received = 0;
+    }
+    pthread_mutex_unlock(&sw->lock);
+}
+
 /* main controller function */
 int main(int argc, char *argv[]) {
     int port = OFP_TCP_PORT;
@@ -69,7 +85,7 @@ int main(int argc, char *argv[]) {
         sleep(1);
     }
     
-    /* cleanup */
+    /* cleanup threads */
     for (int i = 0; i < MAX_SWITCHES; i++) {
         pthread_mutex_lock(&switches[i].lock);
         if (switches[i].active) {
@@ -81,10 +97,10 @@ int main(int argc, char *argv[]) {
         pthread_mutex_destroy(&switches[i].lock);
     }
     
-    /* Close server socket */
+    /* close server socket */
     close(server_socket);
     
-    /* Destroy global mutex */
+    /* destroy global mutex */
     pthread_mutex_destroy(&switches_lock);
     return 0;
 }
@@ -96,23 +112,28 @@ void init_controller(int port) {
     struct sockaddr_in addr;
     int i, opt = 1;
     
-    /* initialize switch array */
+    /* initialize switch array which will handle info about connected switches */
+    /* each will have a thread lock for thread safety */
     for (i = 0; i < MAX_SWITCHES; i++) {
         memset(&switches[i], 0, sizeof(struct switch_info));
         pthread_mutex_init(&switches[i].lock, NULL);
     }
     
-    /* global variable create a tcp server socket, SOCK_STREAM = TCP */
+    /* GLOBAL VARIABLE create a tcp server socket, SOCK_STREAM = TCP */
     server_socket = socket(AF_INET, SOCK_STREAM, 0);
     if (server_socket < 0) {
         perror("Failed to create socket");
         exit(1);
     }
+
+    printf("Server socket created successfully\n");
     
     /* set socket options */
-    setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
     
-    /* Bind to port */
+    setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    printf("Socket options set\n");
+    
+    /* bind to port */
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = INADDR_ANY;      /* listen on all interfaces */
@@ -123,6 +144,8 @@ void init_controller(int port) {
         perror("Failed to bind");
         exit(1);
     }
+
+    printf("Socket bound successfully to port %d\n", port);
     
     /* listen for connections */
     if (listen(server_socket, 5) < 0) {
@@ -131,7 +154,8 @@ void init_controller(int port) {
     }
     
     /* start accept thread, creates a thread that listens for new connections
-     * the handler will create new threads for each new connection */
+     * the handler will create new threads for each new connection 
+     * pass no args to handler */
     pthread_t accept_thread;
     if (pthread_create(&accept_thread, NULL, accept_handler, NULL) != 0) {
         perror("Failed to create accept thread");
@@ -139,55 +163,60 @@ void init_controller(int port) {
     }
 }
 
+/* -------------------------------------------------- Initialize Threads ------------------------------------------------------- */
+
 /* accept incoming switch connections, spawns new threads for each connection */
 void *accept_handler(void *arg) {
     struct sockaddr_in addr;
     socklen_t addr_len = sizeof(addr);
     
+    printf("Accept handler thread started\n");
+    
     while (running) {
+        printf("Waiting for connection on port %d...\n", OFP_TCP_PORT);
         /* accept new connection from the socket created in init_controller */
         int client = accept(server_socket, (struct sockaddr *)&addr, &addr_len);
         if (client < 0) {
-
-            /* if accept fails, check if it was interrupted by a signal and if the controller is shutting down */
-            if (errno == EINTR && !running){
+            if (errno == EINTR && !running) {
+                printf("Accept interrupted by shutdown\n");
                 break;
-            } else {
-                perror("Accept failed");
-                continue;
             }
+            printf("Accept failed with error: %s\n", strerror(errno));
+            continue;
         }
         
+        printf("New connection accepted from %s:%d\n", 
+               inet_ntoa(addr.sin_addr), ntohs(addr.sin_port));
+
         /* find free switch slot */
-        pthread_mutex_lock(&switches_lock);      /* lock to prevent other threads from writing */
+        pthread_mutex_lock(&switches_lock);
         int i;
         for (i = 0; i < MAX_SWITCHES; i++) {
             if (!switches[i].active) {
-                switches[i].socket = client;     /* assign socket to switch */
+                printf("Using switch slot %d\n", i);
+                switches[i].socket = client;
                 switches[i].active = 1;
                 
-                /* create thread to handle that new switch connection  */
+                /* create handler thread */
                 if (pthread_create(&switches[i].thread, NULL, switch_handler, &switches[i]) != 0) {
                     perror("Failed to create switch handler thread");
                     close(client);
-                    switches[i].active = 0;     /* mark as inactive */
+                    switches[i].active = 0;
+                    printf("Failed to create handler thread for switch %d\n", i);
                 } else {
-                    log_msg("New switch connection from %s:%d\n", 
-                           inet_ntoa(addr.sin_addr), ntohs(addr.sin_port));
+                    printf("Successfully created handler thread for switch %d\n", i);
                 }
                 break;
             }
         }
-
-        /* unlock threads */
         pthread_mutex_unlock(&switches_lock);
         
-        /* edge case handler where max switches has been reached */
         if (i == MAX_SWITCHES) {
-            log_msg("Maximum number of switches reached, rejecting connection\n");
+            printf("Maximum number of switches reached, rejecting connection\n");
             close(client);
         }
     }
+    printf("Accept handler exiting\n");
     return NULL;
 }
 
@@ -195,27 +224,46 @@ void *accept_handler(void *arg) {
 void *switch_handler(void *arg) {
     struct switch_info *sw = (struct switch_info *)arg;
     uint8_t buf[OFP_MAX_MSG_SIZE];
+    ssize_t len;
+    
+    printf("Switch handler started for new connection\n");
     
     /* initialize switch state */
     sw->hello_received = 0;
+    sw->features_received = 0;
     
-    /* start OpenFlow handshake with HELLO message */
+    /* start OpenFlow handshake */
     send_hello(sw);
     
-    /* message handling loop, waiting for hello */
+    /* message handling loop */
     while (sw->active && running) {
-        ssize_t len = recv(sw->socket, buf, sizeof(buf), 0);
-        if (len <= 0) {
-            if (len < 0) perror("Receive failed");
+        len = recv(sw->socket, buf, sizeof(buf), 0);
+        
+        if (len == 0) {
+            log_msg("Connection closed cleanly by switch %016" PRIx64 "\n", sw->datapath_id);
+            break;
+        } else if (len < 0) {
+            if (errno == EINTR) {
+                continue; 
+            } else if (errno == ECONNRESET) {
+                log_msg("Connection reset by switch %016" PRIx64 "\n", sw->datapath_id);
+            } else {
+                log_msg("Receive error on switch %016" PRIx64 ": %s\n", 
+                        sw->datapath_id, strerror(errno));
+            }
             break;
         }
         
         /* process message */
         handle_switch_message(sw, buf, len);
         
-        /* check if we need to disconnect due to version mismatch */
-        if (!sw->active) {
-            break;
+        /* keep connection alive with echo requests */
+        if (sw->features_received) {
+            time_t now = time(NULL);
+            if (now - sw->last_echo > ECHO_INTERVAL) {
+                send_echo_request(sw);
+                sw->last_echo = now;
+            }
         }
     }
     
@@ -225,38 +273,16 @@ void *switch_handler(void *arg) {
         sw->active = 0;
         close(sw->socket);
         free(sw->ports);
+        sw->ports = NULL;
+        sw->num_ports = 0;
     }
     pthread_mutex_unlock(&sw->lock);
     
+    printf("Switch handler exiting\n");
     return NULL;
 }
 
-/* --------------------------------- Response/Reply Funtions ----------------------------------- */
-
-/* Send HELLO message */
-void send_hello(struct switch_info *sw) {
-    struct ofp_header hello;
-    
-    hello.version = OFP_VERSION;
-    hello.type = OFPT_HELLO;
-    hello.length = htons(sizeof(hello));
-    hello.xid = htonl(0);
-    
-    /* use OpenFlow hello packet */
-    send_openflow_msg(sw, &hello, sizeof(hello));
-}
-
-/* send OpenFlow message */
-void send_openflow_msg(struct switch_info *sw, void *msg, size_t len) {
-
-    pthread_mutex_lock(&sw->lock);      /* lock threads for safety */
-    if (sw->active) {
-        if (send(sw->socket, msg, len, 0) < 0) {      /* send to socket at switch */
-            perror("Failed to send message");
-        }
-    }
-    pthread_mutex_unlock(&sw->lock);
-}
+/* ----------------------------------------------- Handle Openflow Messages ---------------------------------------------------- */
 
 /* handle incoming OpenFlow message, see while loop in switch handler */
 void handle_switch_message(struct switch_info *sw, uint8_t *msg, size_t len) {
@@ -268,24 +294,31 @@ void handle_switch_message(struct switch_info *sw, uint8_t *msg, size_t len) {
         return;
     }
     
-    /* handle based on message type */
+    /* Hhndle based on message type */
     switch (oh->type) {
         case OFPT_HELLO:
             handle_hello(sw, oh);
             break;
             
+        case OFPT_ECHO_REQUEST:
+            handle_echo_request(sw, oh);
+            break;
+            
+        case OFPT_ECHO_REPLY:
+            handle_echo_reply(sw, oh);
+            break;
+            
         case OFPT_FEATURES_REPLY:
             handle_features_reply(sw, (struct ofp_switch_features *)msg);
+            sw->features_received = 1;
             break;
             
         case OFPT_PACKET_IN:
-            /* handle_packet_in(sw, (struct ofp_packet_in *)msg); */
-            log_msg("Packet in received from switch %016" PRIx64 "\n", sw->datapath_id);
+            handle_packet_in(sw, (struct ofp_packet_in *)msg);
             break;
             
         case OFPT_PORT_STATUS:
-            /* handle_port_status(sw, (struct ofp_port_status *)msg); */
-            log_msg("Port status change on switch %016" PRIx64 "\n", sw->datapath_id);
+            handle_port_status(sw, (struct ofp_port_status *)msg);
             break;
             
         default:
@@ -316,16 +349,15 @@ void handle_hello(struct switch_info *sw, struct ofp_header *oh) {
     }
 }
 
-/* send features request */
-void send_features_request(struct switch_info *sw) {
-    struct ofp_header freq;
+/* Handle echo requests/replies */
+void handle_echo_request(struct switch_info *sw, struct ofp_header *oh) {
+    struct ofp_header echo;
     
-    freq.version = OFP_VERSION;
-    freq.type = OFPT_FEATURES_REQUEST;
-    freq.length = htons(sizeof(freq));
-    freq.xid = htonl(1);
+    /* Simply change the type to reply and send it back */
+    memcpy(&echo, oh, sizeof(echo));
+    echo.type = OFPT_ECHO_REPLY;
     
-    send_openflow_msg(sw, &freq, sizeof(freq));
+    send_openflow_msg(sw, &echo, sizeof(echo));
 }
 
 /* handle features reply */
@@ -394,3 +426,187 @@ void handle_features_reply(struct switch_info *sw, struct ofp_switch_features *f
         if (curr & OFPPF_PAUSE_ASYM) log_msg("    - Asymmetric pause\n");
     }
 }
+
+/* handle incoming packets from the switch */
+void handle_packet_in(struct switch_info *sw, struct ofp_packet_in *pi) {
+    if (!pi) {
+        log_msg("Error: Null packet_in message\n");
+        return;
+    }
+
+    /* lock switch for thread safety while accessing switch info */
+    pthread_mutex_lock(&sw->lock);
+    
+    /* increment packet counter */
+    sw->packet_in_count++;
+    
+    /* extract basic packet information */
+    uint32_t buffer_id = ntohl(pi->buffer_id);
+    uint16_t total_len = ntohs(pi->total_len);
+    uint16_t in_port = ntohs(pi->in_port);
+    
+    /* get reason for packet in */
+    const char *reason_str = "Unknown";
+    switch (pi->reason) {
+        case OFPR_NO_MATCH:
+            reason_str = "No matching flow";
+            break;
+        case OFPR_ACTION:
+            reason_str = "Action explicitly output to controller";
+            break;
+        default:
+            reason_str = "Unknown reason";
+    }
+    
+    /* log packet information */
+    log_msg("\nPACKET_IN from switch %016" PRIx64 ":\n", sw->datapath_id);
+    log_msg("  Buffer ID: %u\n", buffer_id);
+    log_msg("  Total Length: %u bytes\n", total_len);
+    log_msg("  In Port: %u\n", in_port);
+    log_msg("  Reason: %s\n", reason_str);
+
+    
+    pthread_mutex_unlock(&sw->lock);
+}
+
+/* handle echo reply messages */
+void handle_echo_reply(struct switch_info *sw, struct ofp_header *oh) {
+    pthread_mutex_lock(&sw->lock);
+    
+    /* update both last reply and last echo time */
+    sw->last_echo_reply = time(NULL);
+    sw->last_echo = sw->last_echo_reply;  // Add this line
+    
+    /* for debugging */
+    log_msg("Echo reply received from switch %016" PRIx64 "\n", sw->datapath_id);
+    
+    pthread_mutex_unlock(&sw->lock);
+}
+
+/* handle port status changes */
+void handle_port_status(struct switch_info *sw, struct ofp_port_status *ps) {
+    if (!ps) {
+        log_msg("Error: Null port_status message\n");
+        return;
+    }
+
+    pthread_mutex_lock(&sw->lock);
+    
+    /* increment port change counter */
+    sw->port_changes++;
+    
+    /* get the port description */
+    struct ofp_phy_port *port = &ps->desc;
+    
+    /* onvert port state to string */
+    const char *state_str;
+    if (ntohl(port->state) & OFPPS_LINK_DOWN) {
+        state_str = "DOWN";
+    } else {
+        state_str = "UP";
+    }
+    
+    /* convert reason to string */
+    const char *reason_str;
+    switch (ps->reason) {
+        case OFPPR_ADD:
+            reason_str = "PORT ADDED";
+            break;
+        case OFPPR_DELETE:
+            reason_str = "PORT REMOVED";
+            break;
+        case OFPPR_MODIFY:
+            reason_str = "PORT MODIFIED";
+            break;
+        default:
+            reason_str = "UNKNOWN";
+    }
+    
+    /* log the port status change */
+    log_msg("\nPort status change on switch %016" PRIx64 ":\n", sw->datapath_id);
+    log_msg("  Port: %u (%s)\n", ntohs(port->port_no), port->name);
+    log_msg("  Reason: %s\n", reason_str);
+    log_msg("  State: %s\n", state_str);
+    log_msg("  Hardware Addr: %02x:%02x:%02x:%02x:%02x:%02x\n",
+            port->hw_addr[0], port->hw_addr[1], port->hw_addr[2],
+            port->hw_addr[3], port->hw_addr[4], port->hw_addr[5]);
+    
+    /* update port information in switch state */
+    switch (ps->reason) {
+        case OFPPR_ADD:
+            /* would need to reallocate ports array to add new port */
+            break;
+            
+        case OFPPR_DELETE:
+            /* would need to remove port from ports array */
+            break;
+            
+        case OFPPR_MODIFY:
+            /* update existing port information */
+            for (int i = 0; i < sw->num_ports; i++) {
+                if (ntohs(sw->ports[i].port_no) == ntohs(port->port_no)) {
+                    memcpy(&sw->ports[i], port, sizeof(struct ofp_phy_port));
+                    break;
+                }
+            }
+            break;
+    }
+    
+    pthread_mutex_unlock(&sw->lock);
+}
+
+/* ------------------------------------------------ Send Openflow Messages ----------------------------------------------------- */
+
+/* default function for sending OpenFlow message */
+void send_openflow_msg(struct switch_info *sw, void *msg, size_t len) {
+
+    pthread_mutex_lock(&sw->lock);      /* lock threads for safety */
+    if (sw->active) {
+        if (send(sw->socket, msg, len, 0) < 0) {      /* send to socket at switch */
+            perror("Failed to send message");
+        }
+    }
+    pthread_mutex_unlock(&sw->lock);
+}
+
+/* send HELLO message */
+void send_hello(struct switch_info *sw) {
+    struct ofp_header hello;
+    
+    hello.version = OFP_VERSION;
+    hello.type = OFPT_HELLO;
+    hello.length = htons(sizeof(hello));
+    hello.xid = htonl(0);
+    
+    /* use OpenFlow hello packet */
+    send_openflow_msg(sw, &hello, sizeof(hello));
+}
+
+/* add echo request/reply support */
+void send_echo_request(struct switch_info *sw) {
+    struct ofp_header echo;
+    
+    echo.version = OFP_VERSION;
+    echo.type = OFPT_ECHO_REQUEST;
+    echo.length = htons(sizeof(echo));
+    echo.xid = htonl(sw->echo_xid++);
+    
+    send_openflow_msg(sw, &echo, sizeof(echo));
+}
+
+/* send features request */
+void send_features_request(struct switch_info *sw) {
+    struct ofp_header freq;
+    
+    freq.version = OFP_VERSION;
+    freq.type = OFPT_FEATURES_REQUEST;
+    freq.length = htons(sizeof(freq));
+    freq.xid = htonl(1);
+    
+    send_openflow_msg(sw, &freq, sizeof(freq));
+}
+
+
+
+
+
