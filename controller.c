@@ -418,7 +418,6 @@ void handle_switch_message(struct switch_info *sw, uint8_t *msg, size_t len) {
             
         case OFPT_FEATURES_REPLY:
             handle_features_reply(sw, (struct ofp_switch_features *)msg);
-            sw->features_received = 1;
             break;
             
         case OFPT_PACKET_IN:
@@ -594,6 +593,15 @@ void handle_packet_in(struct switch_info *sw, struct ofp_packet_in *pi) {
     log_msg("  In Port: %u\n", in_port);
     log_msg("  Reason: %s\n", reason_str);
 
+    /* Examine ethernet frame if present */
+    if (total_len >= 14) { // Minimum ethernet frame size
+        uint8_t *data = pi->data;
+        log_msg("  Ethernet: dst=%02x:%02x:%02x:%02x:%02x:%02x "
+                "src=%02x:%02x:%02x:%02x:%02x:%02x type=0x%04x\n",
+                data[0], data[1], data[2], data[3], data[4], data[5],
+                data[6], data[7], data[8], data[9], data[10], data[11],
+                (data[12] << 8) | data[13]);
+    }
     
     pthread_mutex_unlock(&sw->lock);
 }
