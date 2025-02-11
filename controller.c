@@ -2,6 +2,54 @@
  * sudo mn --controller=remote,ip=IP,port=6633 --switch=ovsk,protocols=OpenFlow13
  */
 
+/*
+* From my understanding of OpenFlow, here is how the conrtoller works
+* 1. The controller listens for incoming connections from switches
+*  - A socket is created for TCP connections.
+*  - The socket is bound to a port and listens for incoming connections.
+*  - All indexes in the switch array have a mutex locked placed on them for later.
+*  - A thread is created to handle incoming connections by running the accept_handler.
+*
+* 2. The accept_handler function is called when a new connection is accepted by the listener thread.
+*  - The function locks the switch array and finds a free slot to store the switch information.
+*  - Once locked, finds a free slot in the switch array to store the switch information.
+*  - The switch socket is stored in the switch array and a new thread is created run switch_handler.
+*  - The switch array is unlocked.
+*  - If the maximum number of switches is reached, the connection is rejected.
+*  - Each new thread handles communication between the controller and the switch.
+*
+* 3. In the switch handler, the thread begins the OpenFlow handshake.
+*  - Thread sends a HELLO message to the switch with send_hello.
+*  - The switch handler thread waits for incoming messages from the switch.
+*  - The thread processes incoming messages with handle_switch_message.
+*  - The switch handler thread sends an ECHO_REQUEST to the switch every 5 seconds.
+*  - The switch handler thread waits for an ECHO_REPLY from the switch.
+*
+* 4. The handle_switch_message function processes incoming OpenFlow messages.
+*  - The function verifies the message length.
+*  - The function processes the message based on the message type.
+*       - handle_hello updates the switch version and sends a features request.
+*       - handle_echo_request sends an ECHO_REPLY back to the switch.
+*       - handle_echo_reply updates the last_echo_reply time.
+*       - handle_features_reply updates switch features and port information.
+*       - handle_packet_in logs packet information.
+*       - handle_port_status logs port status changes.
+*
+* 5. The send_openflow_msg function sends OpenFlow messages to the switch.
+*  - The function locks the switch mutex.
+*  - The function sends the message to the switch socket.
+*  - The function unlocks the switch mutex.
+*
+* 6. The send_hello function sends a HELLO message to the switch.
+*  - The function creates a HELLO message and sends it to the switch.
+*
+* 7. The send_features_request function sends a FEATURES_REQUEST to the switch.
+*  - The function creates a FEATURES_REQUEST message and sends it to the switch.
+*
+* 8. The send_echo_request function sends an ECHO_REQUEST to the switch.
+*  - The function creates an ECHO_REQUEST message and sends it to the switch.
+*/
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -15,6 +63,7 @@
 #include <inttypes.h>
 #include <stdarg.h>
 #include <netinet/tcp.h>
+#include <stdbool.h>
 
 #if defined(__linux__)
     #include <endian.h>
@@ -225,6 +274,7 @@ void *switch_handler(void *arg) {
     struct switch_info *sw = (struct switch_info *)arg;
     uint8_t buf[OFP_MAX_MSG_SIZE];
     ssize_t len;
+    time_t next_echo = time(NULL) + ECHO_INTERVAL;
     
     printf("Switch handler started for new connection\n");
     
@@ -260,9 +310,13 @@ void *switch_handler(void *arg) {
         /* keep connection alive with echo requests */
         if (sw->features_received) {
             time_t now = time(NULL);
-            if (now - sw->last_echo > ECHO_INTERVAL) {
+            if (now >= next_echo) {
+                if (sw->echo_pending && (now - sw->last_echo) > ECHO_TIMEOUT) {
+                    /* echo reply timeout - reset pending flag */
+                    sw->echo_pending = false;
+                }
                 send_echo_request(sw);
-                sw->last_echo = now;
+                next_echo = now + ECHO_INTERVAL;  /* schedule next echo */
             }
         }
     }
@@ -332,11 +386,11 @@ void handle_hello(struct switch_info *sw, struct ofp_header *oh) {
     sw->hello_received = 1;  /* mark HELLO as received */
     log_msg("Switch hello received, version 0x%02x\n", sw->version);
     
-    /* Only send features request after HELLO exchange is complete */
+    /* only send features request after HELLO exchange is complete */
     if (sw->version == OFP_VERSION) {
         send_features_request(sw);
     } else {
-        /* Version mismatch - should send error */
+        /* version mismatch - should send error */
         struct ofp_error_msg error;
         error.header.version = OFP_VERSION;
         error.header.type = OFPT_ERROR;
@@ -345,11 +399,11 @@ void handle_hello(struct switch_info *sw, struct ofp_header *oh) {
         error.type = htons(OFPET_HELLO_FAILED);
         error.code = htons(OFPHFC_INCOMPATIBLE);
         send_openflow_msg(sw, &error, sizeof(error));
-        sw->active = 0;  /* Mark for disconnection */
+        sw->active = 0;  /* mark for disconnection */
     }
 }
 
-/* Handle echo requests/replies */
+/* handle echo requests/replies */
 void handle_echo_request(struct switch_info *sw, struct ofp_header *oh) {
     struct ofp_header echo;
     
@@ -475,10 +529,12 @@ void handle_echo_reply(struct switch_info *sw, struct ofp_header *oh) {
     
     /* update both last reply and last echo time */
     sw->last_echo_reply = time(NULL);
-    sw->last_echo = sw->last_echo_reply;  // Add this line
-    
+    sw->last_echo = sw->last_echo_reply;
+    sw->echo_pending = false;  // Mark that we can send another echo
+
     /* for debugging */
-    log_msg("Echo reply received from switch %016" PRIx64 "\n", sw->datapath_id);
+    log_msg("Echo reply received from switch %016" PRIx64 " (XID: %u)\n", 
+            sw->datapath_id, ntohl(oh->xid));
     
     pthread_mutex_unlock(&sw->lock);
 }
@@ -584,14 +640,19 @@ void send_hello(struct switch_info *sw) {
 
 /* add echo request/reply support */
 void send_echo_request(struct switch_info *sw) {
-    struct ofp_header echo;
-    
-    echo.version = OFP_VERSION;
-    echo.type = OFPT_ECHO_REQUEST;
-    echo.length = htons(sizeof(echo));
-    echo.xid = htonl(sw->echo_xid++);
-    
-    send_openflow_msg(sw, &echo, sizeof(echo));
+
+    /* only send if not waiting for a reply */
+    if (!sw->echo_pending) {
+        struct ofp_header echo;
+        
+        echo.version = OFP_VERSION;
+        echo.type = OFPT_ECHO_REQUEST;
+        echo.length = htons(sizeof(echo));
+        echo.xid = htonl(sw->last_echo_xid);
+        
+        sw->echo_pending = true;
+        send_openflow_msg(sw, &echo, sizeof(echo));
+    }
 }
 
 /* send features request */

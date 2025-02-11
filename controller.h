@@ -11,6 +11,7 @@
 #include <arpa/inet.h>
 #include <signal.h>
 #include <pthread.h>
+#include <stdbool.h>
 #include "openflow.h"
 
 #define MAX_SWITCHES 16
@@ -44,6 +45,8 @@ struct switch_info {
     time_t last_echo;      // Last echo request sent
     time_t last_echo_reply; // Last echo reply received
     uint32_t echo_xid; 
+    uint32_t last_echo_xid;     // Last XID sent
+    bool echo_pending;          // Whether we're waiting for a reply
 };
 
 /* global variables */
