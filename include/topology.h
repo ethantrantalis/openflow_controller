@@ -11,6 +11,8 @@
 #define LINK_TIMEOUT 30                 /* seconds */
 #define ETHERNET_ADDR_LEN 6
 
+
+
 struct link {
     uint64_t src_dpid;       /* source switch datapath ID */
     uint16_t src_port;       /* aource port number */

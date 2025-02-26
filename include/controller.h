@@ -18,6 +18,7 @@
 #include <netinet/tcp.h>
 #include <stdbool.h>
 #include <time.h>
+#include <sys/time.h>  /* Add this for gettimeofday */
 #include "openflow.h"
 
 #define MAX_SWITCHES 16
@@ -33,7 +34,7 @@
     #define be64toh(x) OSSwapBigToHostInt64(x)
 #endif
 
-/* structure to track connected switches */
+/* Structure to track connected switches */
 struct switch_info {
     int socket;                  /* connection socket */
     pthread_t thread;           /* handler thread */
@@ -62,26 +63,29 @@ struct switch_info {
     bool echo_pending;          /* whether we're waiting for a reply */
 };
 
+/* Forward declaration of topology structure */
+struct network_topology;
 
+/* Global variables */
+extern struct switch_info switches[MAX_SWITCHES];
+extern pthread_mutex_t switches_lock;
+extern int server_socket;
+extern volatile int running;
 
-/* global variables */
-struct switch_info switches[MAX_SWITCHES];
-pthread_mutex_t switches_lock = PTHREAD_MUTEX_INITIALIZER;
-int server_socket;
-volatile int running = 1; /* for controller clean up and running */
+/* Milestone 2 globals */
+extern struct network_topology topology;
+extern pthread_t topology_thread;
 
-/* milestone 2 globals */
-struct network_topology topology;
-pthread_t topology_thread;
-
-/* function prototypes */
-void signal_handler(int signum); 
-void log_msg(const char *format, ...); 
+/* Function prototypes */
+void signal_handler(int signum);
+void log_msg(const char *format, ...);
 int main(int argc, char *argv[]);
-void init_controller(int port); 
-void *accept_handler(void *arg); 
-void *switch_handler(void *arg); 
+void init_controller(int port);
+void *accept_handler(void *arg);
+void *switch_handler(void *arg);
 void cleanup_switch(struct switch_info *sw);
 
+#include "topology.h"
+#include "communication.h"
 
 #endif

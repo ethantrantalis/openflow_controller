@@ -1,17 +1,32 @@
 # Compiler and flags
 CC = gcc
-CFLAGS = -Wall -Werror -g
+CFLAGS = -Wall -Werror -g -I./include
 LDFLAGS = -pthread
 
 # Target executable
 TARGET = controller
 
-# Source files and headers
-SRCS = controller.c checksum.c smartalloc.c
-HDRS = controller.h openflow.h
+# Source directories
+SRCDIR = src
+INCLUDEDIR = include
+
+# Source files
+SRCS = $(SRCDIR)/controller.c \
+       $(SRCDIR)/communication.c \
+       $(SRCDIR)/checksum.c \
+       $(SRCDIR)/smartalloc.c \
+       $(SRCDIR)/topology.c
 
 # Object files
-OBJS = controller.o checksum.o smartalloc.o
+OBJS = $(SRCS:.c=.o)
+
+# Header files
+HDRS = $(INCLUDEDIR)/controller.h \
+       $(INCLUDEDIR)/openflow.h \
+       $(INCLUDEDIR)/checksum.h \
+       $(INCLUDEDIR)/smartalloc.h \
+       $(INCLUDEDIR)/topology.h \
+       $(INCLUDEDIR)/communication.h
 
 # Default target
 all: $(TARGET)
@@ -21,11 +36,11 @@ $(TARGET): $(OBJS)
 	$(CC) $(OBJS) -o $(TARGET) $(LDFLAGS)
 
 # Compile source files
-%.o: %.c $(HDRS)
+$(SRCDIR)/%.o: $(SRCDIR)/%.c $(HDRS)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 # Clean up
 clean:
-	rm -f $(TARGET) *.o
+	rm -f $(TARGET) $(SRCDIR)/*.o
 
 .PHONY: all clean

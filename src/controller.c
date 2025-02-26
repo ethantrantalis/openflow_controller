@@ -49,17 +49,20 @@
 * 8. The send_echo_request function sends an ECHO_REQUEST to the switch.
 *  - The function creates an ECHO_REQUEST message and sends it to the switch.
 */
-#include "smartalloc.h"
-#include "checksum.h"
-
-
-
-
 #include "controller.h"
-#include "openflow.h"
 
 #define DEF_PORT 6653
 #define DEBUG
+
+/* Global variables */
+struct switch_info switches[MAX_SWITCHES];
+pthread_mutex_t switches_lock = PTHREAD_MUTEX_INITIALIZER;
+int server_socket;
+volatile int running = 1; /* for controller clean up and running */
+
+/* milestone 2 globals */
+struct network_topology topology;
+pthread_t topology_thread;
 
 
 /* signal handler */
