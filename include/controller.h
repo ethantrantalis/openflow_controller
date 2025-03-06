@@ -18,7 +18,8 @@
 #include <netinet/tcp.h>
 #include <stdbool.h>
 #include <time.h>
-#include <sys/time.h>  /* Add this for gettimeofday */
+#include <sys/time.h>
+#include <limits.h>
 #include "openflow.h"
 
 #define MAX_SWITCHES 16
@@ -34,7 +35,7 @@
     #define be64toh(x) OSSwapBigToHostInt64(x)
 #endif
 
-/* Structure to track connected switches */
+/* structure to track connected switches */
 struct switch_info {
     int socket;                  /* connection socket */
     pthread_t thread;           /* handler thread */
@@ -63,20 +64,20 @@ struct switch_info {
     bool echo_pending;          /* whether we're waiting for a reply */
 };
 
-/* Forward declaration of topology structure */
+/* forward declaration of topology structure */
 struct network_topology;
 
-/* Global variables */
+/* global variables defined in controller.c */
 extern struct switch_info switches[MAX_SWITCHES];
 extern pthread_mutex_t switches_lock;
 extern int server_socket;
 extern volatile int running;
 
-/* Milestone 2 globals */
-extern struct network_topology topology;
+/* milestone 2 globals */
+extern struct network_topology global_topology;
 extern pthread_t topology_thread;
 
-/* Function prototypes */
+
 void signal_handler(int signum);
 void log_msg(const char *format, ...);
 int main(int argc, char *argv[]);

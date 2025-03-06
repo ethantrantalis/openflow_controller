@@ -12,10 +12,10 @@
 void init_topology() {
 
     /* initialize the topology data structure, global struct */
-    topology.links = NULL; 
-    topology.num_links = 0;
-    topology.capacity = 0;
-    pthread_mutex_init(&topology.lock, NULL);
+    global_topology.nodes = NULL; 
+    global_topology.num_links = 0;
+    global_topology.capacity = 0;
+    pthread_mutex_init(&global_topology.lock, NULL);
     
     /* start the topology discovery thread */
     if (pthread_create(&topology_thread, NULL, topology_discovery_loop, NULL) != 0) {
@@ -34,6 +34,7 @@ void *topology_discovery_loop(void *arg) {
         for (i = 0; i < MAX_SWITCHES; i++) {
             if (switches[i].active && switches[i].features_received) { /* verify that this slot has an active switch */
 
+                /* iterate over all ports on the switch to discover links on this node */
                 int j;
                 for (j = 0; j < switches[i].num_ports; j++) {
                     uint16_t port_no = ntohs(switches[i].ports[j].port_no);
@@ -55,7 +56,7 @@ void *topology_discovery_loop(void *arg) {
         pthread_mutex_unlock(&switches_lock);
         
         /* clean up stale links */
-        topology_cleanup_stale_links();
+        // topology_cleanup_stale_links();
         
         /* sleep before next discovery round */
         sleep(TOPOLOGY_DISCOVERY_INTERVAL); 
@@ -65,76 +66,6 @@ void *topology_discovery_loop(void *arg) {
     return NULL;
 }
 
-void topology_add_link(uint64_t src_dpid, uint16_t src_port, 
-                       uint64_t dst_dpid, uint16_t dst_port) {
-    pthread_mutex_lock(&topology.lock);
-    
-    /* check if link already exists */
-    int i;
-    for (i = 0; i < topology.num_links; i++) {
-        if (topology.links[i].src_dpid == src_dpid && 
-            topology.links[i].src_port == src_port &&
-            topology.links[i].dst_dpid == dst_dpid && 
-            topology.links[i].dst_port == dst_port) {
-            /* Update last seen time */
-            topology.links[i].last_seen = time(NULL);
-            pthread_mutex_unlock(&topology.lock);
-            return;
-        }
-    }
-    
-    /* expand the links array if needed */
-    if (topology.num_links >= topology.capacity) {
-        int new_capacity = (topology.capacity == 0) ? 16 : topology.capacity * 2;
-        struct link *new_links = realloc(topology.links, new_capacity * sizeof(struct link));
-        if (!new_links) {
-            log_msg("Failed to allocate memory for links\n");
-            pthread_mutex_unlock(&topology.lock);
-            return;
-        }
-        topology.links = new_links;
-        topology.capacity = new_capacity;
-    }
-    
-    /* add new link */
-    struct link *new_link = &topology.links[topology.num_links++];
-    new_link->src_dpid = src_dpid;
-    new_link->src_port = src_port;
-    new_link->dst_dpid = dst_dpid;
-    new_link->dst_port = dst_port;
-    new_link->last_seen = time(NULL);
-    
-    log_msg("New link added to topology\n");
-    pthread_mutex_unlock(&topology.lock);
-}
-
-void topology_cleanup_stale_links() {
-    pthread_mutex_lock(&topology.lock);
-    time_t now = time(NULL);
-    int i = 0;
-    
-    while (i < topology.num_links) {
-        if (now - topology.links[i].last_seen > LINK_TIMEOUT) {
-
-            /* remove stale link */
-            log_msg("Removing stale link: Switch %016" PRIx64 " Port %u -> Switch %016" PRIx64 " Port %u\n",
-                    topology.links[i].src_dpid, topology.links[i].src_port, 
-                    topology.links[i].dst_dpid, topology.links[i].dst_port);
-            
-            /* move the last link to this position */
-            if (i < topology.num_links - 1) {
-                topology.links[i] = topology.links[topology.num_links - 1];
-            }
-            topology.num_links--;
-        } else {
-            i++;
-        }
-    }
-    
-    pthread_mutex_unlock(&topology.lock);
-}
-
-/* -------------------------------------------------------- LLDP --------------------------------------------------------------- */
 void send_lldp_packet(struct switch_info *sw, uint16_t port_no) {
     
     /* create an LLDP packet on the stack */
@@ -180,12 +111,12 @@ void send_lldp_packet(struct switch_info *sw, uint16_t port_no) {
     po->in_port = htons(OFPP_NONE);
     po->actions_len = htons(sizeof(output));
     
-    /* Copy action and packet data after the header */
+    /* copy action and packet data after the header */
     memcpy((uint8_t*)po + sizeof(struct ofp_packet_out), &output, sizeof(output));
     memcpy((uint8_t*)po + sizeof(struct ofp_packet_out) + sizeof(output),
            lldp_packet, packet_size);
     
-    /* Send the packet_out message */
+    /* send the packet_out message */
     send_openflow_msg(sw, po, total_len);
     free(po);
 }
@@ -213,7 +144,7 @@ void handle_lldp_packet(struct switch_info *sw, struct ofp_packet_in *pi) {
         return;
     }
     
-    /* Skip Ethernet header to get to LLDP payload */
+    /* skip Ethernet header to get to LLDP payload */
     uint8_t *lldp_data = data + 14;
     int offset = 0;
     
@@ -245,4 +176,205 @@ void handle_lldp_packet(struct switch_info *sw, struct ofp_packet_in *pi) {
     
     log_msg("Link discovered: Switch %016" PRIx64 " Port %u -> Switch %016" PRIx64 " Port %u\n",
             src_dpid, src_port, dst_dpid, dst_port);
+            
 }
+
+struct topology_node* find_or_create_node(uint64_t dpid) {
+    pthread_mutex_lock(&global_topology.lock);
+    
+    /* check if node already exists */
+    struct topology_node *current = global_topology.nodes;
+    while (current != NULL) {
+        if (current->dpid == dpid) {
+            pthread_mutex_unlock(&global_topology.lock);
+            return current;
+        }
+        current = current->next;
+    }
+    
+    /* if node doesnt exist create a new one */
+    struct topology_node *new_node = malloc(sizeof(struct topology_node));
+    if (!new_node) {
+        log_msg("Error: Failed to allocate memory for new node\n");
+        pthread_mutex_unlock(&global_topology.lock);
+        return NULL;
+    }
+    
+    new_node->dpid = dpid;
+    new_node->num_links = 0;
+    new_node->links = NULL;
+    new_node->next = global_topology.nodes;  /* add at the beginning for efficiency */
+    global_topology.nodes = new_node;
+    global_topology.num_nodes++;
+    
+    pthread_mutex_unlock(&global_topology.lock);
+    return new_node;
+}
+
+int topology_add_link(uint64_t src_dpid, uint16_t src_port, uint64_t dst_dpid, uint16_t dst_port) {
+
+    /* find or create source node */
+    struct topology_node *src_node = find_or_create_node(src_dpid);
+    if (!src_node) {
+        return -1;
+    }
+    
+    pthread_mutex_lock(&global_topology.lock);
+    
+    /* check if link already exists */
+    struct topology_link *link = src_node->links;
+    while (link != NULL) {
+        if (link->node_port == src_port && 
+            link->linked_dpid == dst_dpid && 
+            link->linked_port == dst_port) {
+            /* update timestamp if link is found */
+            link->last_seen = time(NULL);
+            pthread_mutex_unlock(&global_topology.lock);
+            return 0;
+        }
+        link = link->next;
+    }
+    
+    /* create new link if not already created */
+    struct topology_link *new_link = malloc(sizeof(struct topology_link));
+    if (!new_link) {
+        log_msg("Error: Failed to allocate memory for new link\n");
+        pthread_mutex_unlock(&global_topology.lock);
+        return -1;
+    }
+    
+    new_link->node_port = src_port;
+    new_link->linked_dpid = dst_dpid;
+    new_link->linked_port = dst_port;
+    new_link->last_seen = time(NULL);
+    new_link->next = src_node->links;  /* add at the beginning for efficieny */
+    src_node->links = new_link;
+    src_node->num_links++;
+    global_topology.num_links++;
+    
+    pthread_mutex_unlock(&global_topology.lock);
+    
+    log_msg("Added link: Switch %016" PRIx64 " Port %u -> Switch %016" PRIx64 " Port %u\n",
+            src_dpid, src_port, dst_dpid, dst_port);
+    
+    return 0;
+}
+
+void topology_cleanup_stale_links() {
+
+    pthread_mutex_lock(&global_topology.lock);
+    time_t now = time(NULL);
+    
+    struct topology_node *node = global_topology.nodes;
+    while (node != NULL) { /* start at the head to prevent infinite loops */
+        struct topology_link *prev = NULL;
+        struct topology_link *link = node->links; /* copy links to new pointer */
+        
+        /* iterate through all the links */
+        while (link != NULL) {
+            if (now - link->last_seen > LINK_TIMEOUT) {
+
+                /* remove stale link */
+                struct topology_link *to_remove = link;
+                
+                if (prev == NULL) {
+                    /* if this link is first link in the list */
+                    node->links = link->next;
+                } else {
+                    prev->next = link->next;
+                }
+                
+                link = link->next;
+                free(to_remove);
+                node->num_links--;
+                global_topology.num_links--;
+                
+                log_msg("Removed stale link from node %016" PRIx64 "\n", node->dpid);
+            } else {
+                prev = link;
+                link = link->next;
+            }
+        }
+        
+        node = node->next;
+    }
+    
+    pthread_mutex_unlock(&global_topology.lock);
+}
+
+void topology_remove_link(uint64_t dpid, uint16_t port_no){
+
+    /* ensure that no other devices can modify the topology */
+    pthread_mutex_lock(&global_topology.lock);
+    
+    struct topology_node *node = global_topology.nodes;
+    while (node != NULL){
+        if (node->dpid == dpid){ /* found the switch node associated with link to remove */
+        struct topology_link *prev = NULL;
+        struct topology_link *next = node->links;
+
+        while (next != NULL){
+
+            /* found the link that needs to be removed */
+            if (next->node_port == port_no){
+                if (prev == NULL){
+                    node->links = next->next; /* set head of links to be next if start was null */
+                } else {
+                    prev->next = next->next; /* set previous link to point to next link */
+                }
+                free(next);
+                node->num_links--;
+                global_topology.num_links--;
+                #ifdef DEBUG
+                log_msg("Removed link from switch %016" PRIx64 " port %u to switch %016" PRIx64 " port %u\n",
+                                                        dpid, port_no, next->linked_dpid, next->linked_port);
+                #endif
+                break;
+            }
+            prev = next;
+            next = next->next;
+        }
+        }
+    }
+
+    if (node == NULL){
+        log_msg("Error: Switch %016" PRIx64 " not found in topology\n", dpid);
+    }
+    
+    pthread_mutex_unlock(&global_topology.lock);
+}
+
+
+/*
+┌───────────────────────────────────────────────────────────────────────┐
+│                           CONTROLLER                                  │
+│                                                                       │
+│  ┌───────────────────┐    ┌───────────────────┐    ┌───────────────┐  │
+│  │ Topology Manager  │    │ Path Calculator   │    │ Flow Manager  │  │
+│  │                   │    │                   │    │               │  │
+│  │ - Builds graph    │───>│ - Dijkstra's      │───>│ - Creates     │  │
+│  │ - Tracks links    │    │ - MST             │    │   flow rules  │  │
+│  │ - Updates state   │    │ - Path caching    │    │ - Sends to    │  │
+│  └───────────────────┘    └───────────────────┘    │   switches    │  │
+│            ▲                                       └───────────────┘  │
+│            │                                                 │        │
+└────────────┼─────────────────────────────────────────────────┼────────┘
+             │                                                 │
+             │ PACKET_IN, LLDP, PORT_STATUS                    │ FLOW_MOD, PACKET_OUT
+             │                                                 │
+┌────────────┼─────────────────────────────────────────────────┼────────┐
+│            │                                                 ▼        │
+│   ┌────────┴───────┐     ┌───────────────┐     ┌───────────────────┐  │
+│   │ Switch A       │     │ Switch B      │     │ Switch C          │  │
+│   │                │     │               │     │                   │  │
+│   │  Flow Table:   │     │  Flow Table:  │     │  Flow Table:      │  │
+│   │  dst=MAC_X →   │────>│  dst=MAC_X →  │────>│  dst=MAC_X →      │  │
+│   │  forward(port2)│     │ forward(port3)│     │ forward(port1)    │  │
+│   └────────────────┘     └───────────────┘     └───────────────────┘  │
+│                                                                       │
+│                              NETWORK                                  │
+└───────────────────────────────────────────────────────────────────────┘
+
+
+
+*/

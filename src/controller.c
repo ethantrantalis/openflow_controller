@@ -54,14 +54,14 @@
 #define DEF_PORT 6653
 #define DEBUG
 
-/* Global variables */
+/* global variables defined*/
 struct switch_info switches[MAX_SWITCHES];
 pthread_mutex_t switches_lock = PTHREAD_MUTEX_INITIALIZER;
 int server_socket;
 volatile int running = 1; /* for controller clean up and running */
 
 /* milestone 2 globals */
-struct network_topology topology;
+struct network_topology global_topology;
 pthread_t topology_thread;
 
 
@@ -364,9 +364,3 @@ void *switch_handler(void *arg) {
     printf("Switch handler exiting\n");
     return NULL;
 }
-
-
-
-
-/* -------------------------------------------------- Topology Management ------------------------------------------------------ */
-

@@ -154,7 +154,7 @@ void handle_packet_in(struct switch_info *sw, struct ofp_packet_in *pi) {
         return;
     }
 
-    /* first check for an lldp packet */
+    /* first check for an lldp packet - see topology.c  */
     if (is_lldp_packet(pi->data)) {
         handle_lldp_packet(sw, pi);
         return;  /* no further processing for LLDP packets */
@@ -175,6 +175,8 @@ void handle_packet_in(struct switch_info *sw, struct ofp_packet_in *pi) {
     const char *reason_str = "Unknown";
     switch (pi->reason) {
         case OFPR_NO_MATCH:
+            /* UPDATE THE */
+            /* HANDLE UNICAST AND BROADCASY TRAFFIC HERE */
             reason_str = "No matching flow";
             break;
         case OFPR_ACTION:
@@ -240,12 +242,27 @@ void handle_port_status(struct switch_info *sw, struct ofp_port_status *ps) {
     switch (ps->reason) {
         case OFPPR_ADD:
             reason_str = "PORT ADDED";
+            /* DISCOVER NEW DEVICE ON THAT PORT HERE */
+            send_lldp_packet(sw, ntohs(port->port_no));
             break;
         case OFPPR_DELETE:
             reason_str = "PORT REMOVED";
+            /* FIND THE SWITCH IN TOPOLGY AND REMOVE THE PORT FOR IT */
+            topology_remove_link(sw->datapath_id, ntohs(port->port_no));
             break;
         case OFPPR_MODIFY:
             reason_str = "PORT MODIFIED";
+            if (!(ntohl(port->state) & OFPPS_LINK_DOWN)) { /* port is down */
+                /* UPDATE THE LINK STATUS */
+                topology_remove_link(sw->datapath_id, ntohs(port->port_no));
+                send_lldp_packet(sw, ntohs(port->port_no));
+            } else { /* port is up */
+                /* UPDATE THE LINK STATUS */
+                topology_remove_link(sw->datapath_id, ntohs(port->port_no));
+                send_lldp_packet(sw, ntohs(port->port_no));
+
+
+            }
             break;
         default:
             reason_str = "UNKNOWN";
@@ -259,27 +276,6 @@ void handle_port_status(struct switch_info *sw, struct ofp_port_status *ps) {
     log_msg("  Hardware Addr: %02x:%02x:%02x:%02x:%02x:%02x\n",
             port->hw_addr[0], port->hw_addr[1], port->hw_addr[2],
             port->hw_addr[3], port->hw_addr[4], port->hw_addr[5]);
-    
-    /* update port information in switch state */
-    switch (ps->reason) {
-        case OFPPR_ADD:
-            /* would need to reallocate ports array to add new port */
-            break;
-            
-        case OFPPR_DELETE:
-            /* would need to remove port from ports array */
-            break;
-            
-        case OFPPR_MODIFY:
-            /* update existing port information */
-            for (int i = 0; i < sw->num_ports; i++) {
-                if (ntohs(sw->ports[i].port_no) == ntohs(port->port_no)) {
-                    memcpy(&sw->ports[i], port, sizeof(struct ofp_phy_port));
-                    break;
-                }
-            }
-            break;
-    }
     
     pthread_mutex_unlock(&sw->lock);
 }

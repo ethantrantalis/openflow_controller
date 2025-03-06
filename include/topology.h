@@ -13,18 +13,27 @@
 
 
 
-struct link {
-    uint64_t src_dpid;       /* source switch datapath ID */
-    uint16_t src_port;       /* aource port number */
-    uint64_t dst_dpid;       /* destination switch datapath ID */
-    uint16_t dst_port;       /* destination port number */
+struct topology_link {
+    uint16_t node_port;       /* source port number */
+    uint64_t linked_dpid;       /* destination switch datapath ID */
+    uint16_t linked_port;       /* destination port number */
     time_t last_seen;        /* last time this link was discovered */
+    struct topology_link *next;  /* next link in the list */
+};
+
+struct topology_node {
+    uint64_t dpid;            /* switch datapath ID */
+    int num_links;            /* number of links */
+    struct topology_link *links;  /* linked switches */
+    struct topology_node *next;  /* next node in the list */
+
 };
 
 struct network_topology {
-    struct link *links;      /* array of network links */
+    struct topology_node *nodes;      /* array of network links */
     int num_links;           /* number of links in the network */
     int capacity;            /* capacity of links array */
+    int num_nodes;             /* number of nodes in the graph */
     pthread_mutex_t lock;    /* for thread safety */
 };
 
@@ -34,8 +43,10 @@ void *topology_discovery_loop(void *arg);
 void send_lldp_packet(struct switch_info *sw, uint16_t port_no);
 bool is_lldp_packet(uint8_t *data);
 void handle_lldp_packet(struct switch_info *sw, struct ofp_packet_in *pi);
-void topology_add_link(uint64_t src_dpid, uint16_t src_port, 
+int topology_add_link(uint64_t src_dpid, uint16_t src_port, 
                        uint64_t dst_dpid, uint16_t dst_port);
 void topology_cleanup_stale_links();
+void topology_remove_link(uint64_t dpid, uint16_t port_no);
+
 
 #endif
