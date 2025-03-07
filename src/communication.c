@@ -1,7 +1,7 @@
 #include "controller.h"
 #include "communication.h"
 
-/* ----------------------------------------------- Handle Openflow Messages ---------------------------------------------------- */
+/* ------------------------------------------------ Packet Handler Functions --------------------------------------------------- */
 
 /* handle incoming OpenFlow message, see while loop in switch handler */
 void handle_switch_message(struct switch_info *sw, uint8_t *msg, size_t len) {
@@ -147,56 +147,6 @@ void handle_features_reply(struct switch_info *sw, struct ofp_switch_features *f
     }
 }
 
-/* handle incoming packets from the switch */
-void handle_packet_in(struct switch_info *sw, struct ofp_packet_in *pi) {
-    if (!pi) {
-        log_msg("Error: Null packet_in message\n");
-        return;
-    }
-
-    /* first check for an lldp packet - see topology.c  */
-    if (is_lldp_packet(pi->data)) {
-        handle_lldp_packet(sw, pi);
-        return;  /* no further processing for LLDP packets */
-    }
-
-    /* lock switch for thread safety while accessing switch info */
-    pthread_mutex_lock(&sw->lock);
-    
-    /* increment packet counter */
-    sw->packet_in_count++;
-    
-    /* extract basic packet information */
-    uint32_t buffer_id = ntohl(pi->buffer_id);
-    uint16_t total_len = ntohs(pi->total_len);
-    uint16_t in_port = ntohs(pi->in_port);
-    
-    /* get reason for packet in */
-    const char *reason_str = "Unknown";
-    switch (pi->reason) {
-        case OFPR_NO_MATCH:
-            /* UPDATE THE */
-            /* HANDLE UNICAST AND BROADCASY TRAFFIC HERE */
-            reason_str = "No matching flow";
-            break;
-        case OFPR_ACTION:
-            reason_str = "Action explicitly output to controller";
-            break;
-        default:
-            reason_str = "Unknown reason";
-    }
-    
-    /* log packet information */
-    log_msg("\nPACKET_IN from switch %016" PRIx64 ":\n", sw->datapath_id);
-    log_msg("  Buffer ID: %u\n", buffer_id);
-    log_msg("  Total Length: %u bytes\n", total_len);
-    log_msg("  In Port: %u\n", in_port);
-    log_msg("  Reason: %s\n", reason_str);
-
-    
-    pthread_mutex_unlock(&sw->lock);
-}
-
 /* handle echo reply messages */
 void handle_echo_reply(struct switch_info *sw, struct ofp_header *oh) {
     pthread_mutex_lock(&sw->lock);
@@ -280,18 +230,205 @@ void handle_port_status(struct switch_info *sw, struct ofp_port_status *ps) {
     pthread_mutex_unlock(&sw->lock);
 }
 
+/* ----------------------------------------------- End Packet Handler Functions ------------------------------------------------ */
+
+/* --------------------------------------------------- Flow Installation ------------------------------------------------------- */
+
+/* handle incoming packets from the switch */
+void handle_packet_in(struct switch_info *sw, struct ofp_packet_in *pi) {
+    /*
+    Case 1: Unicast to Same Switch
+    When source and destination MAC addresses are on the same switch:
+
+    Check your MAC table to confirm destination port
+    Install a flow rule that matches destination MAC and input port
+    Action will be to output to the specific destination port
+    Send a PACKET_OUT to handle the current packet
+
+    Case 2: Unicast to Different Switch
+    When destination MAC is known but on a different switch:
+
+    Use Dijkstra's algorithm to find shortest path
+    Install flow rule on current switch to forward to the next hop
+    The flow matches destination MAC and has output action to the appropriate port
+    Send a PACKET_OUT for the current packet
+
+    Case 3: Broadcast
+    When destination is broadcast/multicast (first byte has least significant bit set):
+
+    Calculate MST with current switch as root (or use pre-calculated MST)
+    Install flow rule that matches the broadcast MAC
+    Action will indeed be to output to MULTIPLE ports (all ports in the MST except the input port)
+    For this, you'll need to construct a flow rule with multiple actions
+    */
+
+    if (!pi) {
+        log_msg("Error: Null packet_in message\n");
+        return;
+    }
+
+    /* first check for an lldp packet - see topology.c  */
+    if (is_lldp_packet(pi->data)) {
+        handle_lldp_packet(sw, pi);
+        return;  /* no further processing for LLDP packets */
+    }
+
+    /* extract ethernet frame information */
+    uint8_t *eth_frame_start = pi->data;
+    uint8_t *eth_dst = eth_frame_start;
+    uint8_t *eth_src = eth_frame_start + ETHERNET_ADDR_LEN;
+
+    /* add info from packet to global MAC table */
+    add_mac(eth_src, sw->datapath_id, ntohs(pi->in_port));
+    
+    /* lock switch for thread safety while accessing switch info */
+    pthread_mutex_lock(&sw->lock);
+    
+    /* increment packet counter */
+    sw->packet_in_count++;
+    
+    /* extract basic packet information */
+    uint32_t buffer_id = ntohl(pi->buffer_id);
+    uint16_t total_len = ntohs(pi->total_len);
+    uint16_t in_port = ntohs(pi->in_port);
+    
+    /* get reason for packet in */
+    const char *reason_str = "Unknown";
+    switch (pi->reason) {
+        case OFPR_NO_MATCH:
+            if (memcmp(eth_dst, eth_src, ETHERNET_ADDR_LEN) == 0) {
+
+                /* DIJKSTAS CALCULATION */
+                /* INSTALL FLOW WITH TO FORWARD TO SELF */
+                /* PACKEY OUT WITH pi */
+
+                reason_str = "UNICAST, SAME SRC AND DST";
+            } else if (memcmp(eth_dst, "\xff\xff\xff\xff\xff\xff", ETHERNET_ADDR_LEN) == 0) {
+
+                /* MST CALCULATION */
+                /* INSTALL FLOW FOR BROADCAST */
+                /* PACKET OUT WITH pi */
+
+                reason_str = "BROADCAST";
+            } else {
+
+                /* DIJKSTAS CALCULATION */
+                /* INSTALL FLOW WITH TO FORWARD TO NEXT HOP */
+                /* PACKET OUT WITH pi */
+
+                reason_str = "UNICAST, DIFFERENT SRC AND DST";
+            }
+            break;
+        case OFPR_ACTION:
+            reason_str = "Action explicitly output to controller";
+            break;
+        default:
+            reason_str = "Unknown reason";
+    }
+    
+    /* log packet information */
+    #ifdef DEBUG
+    log_msg("\nPACKET_IN from switch %016" PRIx64 ":\n", sw->datapath_id);
+    log_msg("  Buffer ID: %u\n", buffer_id);
+    log_msg("  Total Length: %u bytes\n", total_len);
+    log_msg("  In Port: %u\n", in_port);
+    log_msg("  Reason: %s\n", reason_str);
+    #endif
+
+    
+    pthread_mutex_unlock(&sw->lock);
+}
+
+void send_flow_mod(struct switch_info *sw, uint8_t *dst_mac, uint16_t output_port) {
+
+    /* length calculations and allocations */
+    int actions_len = sizeof(struct ofp_action_output);
+    int total_len = sizeof(struct ofp_flow_mod) + actions_len;
+
+    struct ofp_flow_mod *flow_mod = malloc(total_len);
+    memset(flow_mod, 0, total_len);
+    
+    /* fill in the ofp_header */
+    flow_mod->header.version = OFP_VERSION;
+    flow_mod->header.type = OFPT_FLOW_MOD;
+    flow_mod->header.length = htons(total_len);
+    flow_mod->header.xid = htonl(0);
+    
+    /* set the match fields to match on destination MAC */
+    flow_mod->match.wildcards = htonl(OFPFW_ALL & ~OFPFW_DL_DST);  /* only match on dl_dst */
+
+    /* IMPORTANT set the mac address to match on in the flow */
+    memcpy(flow_mod->match.dl_dst, dst_mac, OFP_ETH_ALEN);  
+    
+    /* fill in the flow mod fields */
+    flow_mod->command = htons(OFPFC_ADD);  /* new flow */
+    flow_mod->idle_timeout = htons(60);    /* 60 seconds idle timeout */
+    flow_mod->hard_timeout = htons(300);   /* 5 minutes hard timeout */
+    flow_mod->priority = htons(100);      /* priority level MEDIUM */
+    flow_mod->buffer_id = htonl(0xFFFFFFFF);  
+    flow_mod->out_port = htons(OFPP_NONE); /* ignored for flow add */
+    flow_mod->flags = htons(OFPFF_SEND_FLOW_REM);  
+    
+    /* add the output action */
+    struct ofp_action_output *action = (struct ofp_action_output *)flow_mod->actions;
+    action->type = htons(OFPAT_OUTPUT);
+    action->len = htons(sizeof(struct ofp_action_output));
+    action->port = htons(output_port);  /* the port to output matching packets to */
+    action->max_len = htons(0);
+
+    send_openflow_msg(sw, flow_mod, total_len);
+    free(flow_mod);
+}
+
+void send_packet_out(struct switch_info *sw, uint8_t *data, size_t data_len, uint16_t out_port) {
+
+    /* length calculations and allocations */
+    int total_len = sizeof(struct ofp_packet_out) + data_len;
+    struct ofp_packet_out *packet_out = malloc(total_len);
+
+    if (!packet_out) {
+        log_msg("Failed to allocate memory for packet out message\n");
+        return;
+    }
+
+    memset(packet_out, 0, total_len);
+    
+    /* fill in the ofp_header */
+    packet_out->header.version = OFP_VERSION;
+    packet_out->header.type = OFPT_PACKET_OUT;
+    packet_out->header.length = htons(total_len);
+    packet_out->header.xid = htonl(0);
+    
+    /* fill in the packet out fields */
+    packet_out->buffer_id = htonl(0xFFFFFFFF);  /* no buffer */
+    packet_out->in_port = htons(OFPP_NONE);     /* no input port */
+    packet_out->actions_len = htons(0);         /* no actions */
+    
+    /* copy the packet data */
+    memcpy(packet_out + sizeof(struct ofp_packet_out), data, data_len);
+    
+    /* send the packet out message */
+    send_openflow_msg(sw, packet_out, total_len);
+    free(packet_out);
+}
+
+/* ------------------------------------------------ End Flow Installation ------------------------------------------------------ */
+
 /* ------------------------------------------------ Send Openflow Messages ----------------------------------------------------- */
 
-/* default function for sending OpenFlow message */
-void send_openflow_msg(struct switch_info *sw, void *msg, size_t len) {
+/* default function for sending OpenFlow message LOW LEVEL FUNCTION */
+int send_openflow_msg(struct switch_info *sw, void *msg, size_t len) {
 
     pthread_mutex_lock(&sw->lock);      /* lock threads for safety */
     if (sw->active) {
         if (send(sw->socket, msg, len, 0) < 0) {      /* send to socket at switch */
             perror("Failed to send message");
+            pthread_mutex_unlock(&sw->lock);
+            return -1; /* modified to return an int for better error checking */
         }
     }
     pthread_mutex_unlock(&sw->lock);
+    return 0;
 }
 
 /* send HELLO message */
@@ -324,7 +461,7 @@ bool send_echo_request(struct switch_info *sw) {
         bool success = false;
         sw->last_echo = time(NULL);
         if (sw->active) {
-            success = (send(sw->socket, &echo, sizeof(echo), 0) >= 0);
+            success = send_openflow_msg(sw, &echo, sizeof(echo)) >= 0;
             if (!success) {
                 sw->echo_pending = false;  /* reset if send failed */
             }
@@ -352,3 +489,5 @@ void send_features_request(struct switch_info *sw) {
     
     send_openflow_msg(sw, &freq, sizeof(freq));
 }
+
+/* ------------------------------------------------ End Send Openflow Messages -------------------------------------------------- */

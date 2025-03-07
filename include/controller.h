@@ -20,6 +20,7 @@
 #include <time.h>
 #include <sys/time.h>
 #include <limits.h>
+#include "uthash.h"
 #include "openflow.h"
 
 #define MAX_SWITCHES 16
@@ -27,6 +28,7 @@
 #define ECHO_INTERVAL       5    /* Send echo request every 5 seconds */
 #define ECHO_TIMEOUT       15    /* Connection is dead if no reply for 15 seconds */
 #define CLEANUP_INTERVAL   30
+#define MAC_ADDR_LEN 6
 
 #if defined(__linux__)
     #include <endian.h>
@@ -34,6 +36,15 @@
     #include <libkern/OSByteOrder.h>
     #define be64toh(x) OSSwapBigToHostInt64(x)
 #endif
+
+/* mac table stuff */
+struct mac_entry {
+    uint8_t mac[MAC_ADDR_LEN];           /* key */
+    uint64_t switch_dpid;
+    uint16_t port;
+    time_t last_seen;
+    UT_hash_handle hh;        /* makes this structure hashable */
+};
 
 /* structure to track connected switches */
 struct switch_info {
@@ -85,6 +96,10 @@ void init_controller(int port);
 void *accept_handler(void *arg);
 void *switch_handler(void *arg);
 void cleanup_switch(struct switch_info *sw);
+
+/* mac table functions */
+struct mac_entry *find_mac(uint8_t *mac);
+void add_mac(uint8_t *mac, uint64_t dpid, uint16_t port);
 
 #include "topology.h"
 #include "communication.h"

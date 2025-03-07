@@ -1,6 +1,44 @@
 #include "controller.h"
 #include "topology.h"
 
+
+/*
+┌───────────────────────────────────────────────────────────────────────┐
+│                           CONTROLLER                                  │
+│                                                                       │
+│  ┌───────────────────┐    ┌───────────────────┐    ┌───────────────┐  │
+│  │ Topology Manager  │    │ Path Calculator   │    │ Flow Manager  │  │
+│  │                   │    │                   │    │               │  │
+│  │ - Builds graph    │───>│ - Dijkstra's      │───>│ - Creates     │  │
+│  │ - Tracks links    │    │ - MST             │    │   flow rules  │  │
+│  │ - Updates state   │    │ - Path caching    │    │ - Sends to    │  │
+│  └───────────────────┘    └───────────────────┘    │   switches    │  │
+│            ▲                                       └───────────────┘  │
+│            │                                                 │        │
+└────────────┼─────────────────────────────────────────────────┼────────┘
+             │                                                 │
+             │ PACKET_IN, LLDP, PORT_STATUS                    │ FLOW_MOD, PACKET_OUT
+             │                                                 │
+┌────────────┼─────────────────────────────────────────────────┼────────┐
+│            │                                                 ▼        │
+│   ┌────────┴───────┐     ┌───────────────┐     ┌───────────────────┐  │
+│   │ Switch A       │     │ Switch B      │     │ Switch C          │  │
+│   │                │     │               │     │                   │  │
+│   │  Flow Table:   │     │  Flow Table:  │     │  Flow Table:      │  │
+│   │  dst=MAC_X →   │────>│  dst=MAC_X →  │────>│  dst=MAC_X →      │  │
+│   │  forward(port2)│     │ forward(port3)│     │ forward(port1)    │  │
+│   └────────────────┘     └───────────────┘     └───────────────────┘  │
+│                                                                       │
+│                              NETWORK                                  │
+└───────────────────────────────────────────────────────────────────────┘
+
+
+
+*/
+
+
+
+
 #if defined(__linux__)
     #include <endian.h>
 #elif defined(__APPLE__)
@@ -344,37 +382,41 @@ void topology_remove_link(uint64_t dpid, uint16_t port_no){
     pthread_mutex_unlock(&global_topology.lock);
 }
 
+/* -------------------------------------------------------- Path Calculation Functions ----------------------------------------- */
 
-/*
-┌───────────────────────────────────────────────────────────────────────┐
-│                           CONTROLLER                                  │
-│                                                                       │
-│  ┌───────────────────┐    ┌───────────────────┐    ┌───────────────┐  │
-│  │ Topology Manager  │    │ Path Calculator   │    │ Flow Manager  │  │
-│  │                   │    │                   │    │               │  │
-│  │ - Builds graph    │───>│ - Dijkstra's      │───>│ - Creates     │  │
-│  │ - Tracks links    │    │ - MST             │    │   flow rules  │  │
-│  │ - Updates state   │    │ - Path caching    │    │ - Sends to    │  │
-│  └───────────────────┘    └───────────────────┘    │   switches    │  │
-│            ▲                                       └───────────────┘  │
-│            │                                                 │        │
-└────────────┼─────────────────────────────────────────────────┼────────┘
-             │                                                 │
-             │ PACKET_IN, LLDP, PORT_STATUS                    │ FLOW_MOD, PACKET_OUT
-             │                                                 │
-┌────────────┼─────────────────────────────────────────────────┼────────┐
-│            │                                                 ▼        │
-│   ┌────────┴───────┐     ┌───────────────┐     ┌───────────────────┐  │
-│   │ Switch A       │     │ Switch B      │     │ Switch C          │  │
-│   │                │     │               │     │                   │  │
-│   │  Flow Table:   │     │  Flow Table:  │     │  Flow Table:      │  │
-│   │  dst=MAC_X →   │────>│  dst=MAC_X →  │────>│  dst=MAC_X →      │  │
-│   │  forward(port2)│     │ forward(port3)│     │ forward(port1)    │  │
-│   └────────────────┘     └───────────────┘     └───────────────────┘  │
-│                                                                       │
-│                              NETWORK                                  │
-└───────────────────────────────────────────────────────────────────────┘
+struct mac_entry * calculate_path(struct mac_entry * final_dst){
+
+    /* find the source switch */
+    struct mac_entry * src = find_mac(final_dst->mac);
+    if (src == NULL){
+        log_msg("Error: Source MAC not found in MAC table\n");
+        return NULL;
+    }
+
+    /* find the destination switch */
+    struct mac_entry * dst = find_mac(final_dst->mac);
+    if (dst == NULL){
+        log_msg("Error: Destination MAC not found in MAC table\n");
+        return NULL;
+    }
+
+    /* find the shortest path between the two switches */
+    struct path * path = dijkstras(src->dpid, dst->dpid);
+
+    /* create a new mac entry to store the path */
+    struct mac_entry * path_entry = malloc(sizeof(struct mac_entry));
+    if (path_entry == NULL){
+        log_msg("Error: Failed to allocate memory for path entry\n");
+        return NULL;
+    }
+
+    /* copy the destination mac address */
+    memcpy(path_entry->mac, final_dst->mac, MAC_ADDR_LEN);
+
+    /* copy the path into the mac entry */
+    path_entry->path = path;
+
+    return path_entry;
 
 
-
-*/
+}

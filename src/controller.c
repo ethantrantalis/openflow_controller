@@ -51,6 +51,34 @@
 */
 #include "controller.h"
 
+
+
+struct mac_entry *mac_table = NULL;
+
+/* add or update an entry */
+void add_mac(uint8_t *mac, uint64_t dpid, uint16_t port) {
+    struct mac_entry *entry;
+    
+    HASH_FIND(hh, mac_table, mac, MAC_ADDR_LEN, entry);
+    if (entry == NULL) {
+        entry = malloc(sizeof(struct mac_entry));
+        memcpy(entry->mac, mac, MAC_ADDR_LEN);
+        HASH_ADD(hh, mac_table, mac, MAC_ADDR_LEN, entry);
+    }
+    
+    /* add other values of update values if already exists */
+    entry->switch_dpid = dpid;
+    entry->port = port;
+    entry->last_seen = time(NULL);
+}
+
+/* find an entry */
+struct mac_entry *find_mac(uint8_t *mac) {
+    struct mac_entry *entry;
+    HASH_FIND(hh, mac_table, mac, MAC_ADDR_LEN, entry);
+    return entry;
+}
+
 #define DEF_PORT 6653
 #define DEBUG
 
