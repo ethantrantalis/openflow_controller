@@ -380,6 +380,123 @@ void send_flow_mod(struct switch_info *sw, uint8_t *dst_mac, uint16_t output_por
     free(flow_mod);
 }
 
+// In communication.c
+
+// Install flow for unicast traffic along a path
+void install_unicast_flows(struct path *path, uint8_t *dst_mac) {
+    if (!path || !path->nodes) {
+        log_msg("Error: Invalid path for flow installation\n");
+        return;
+    }
+    
+    struct path_node *node = path->nodes;
+    
+    while (node != NULL) {
+        struct switch_info *sw = find_switch_by_dpid(node->dpid);
+        if (sw && node->out_port != 0) {
+            send_flow_mod(sw, dst_mac, node->out_port);
+            log_msg("Installed unicast flow on switch %016" PRIx64 " for MAC %02x:%02x:%02x:%02x:%02x:%02x to port %u\n",
+                   node->dpid, dst_mac[0], dst_mac[1], dst_mac[2], dst_mac[3], dst_mac[4], dst_mac[5], node->out_port);
+        }
+        
+        node = node->next;
+    }
+}
+
+// Install flow for broadcast traffic based on MST
+void install_broadcast_flows(struct mst *tree, uint8_t *broadcast_mac) {
+    if (!tree || !tree->nodes) {
+        log_msg("Error: Invalid MST for flow installation\n");
+        return;
+    }
+    
+    for (int i = 0; i < tree->num_nodes; i++) {
+        struct mst_node *node = &tree->nodes[i];
+        struct switch_info *sw = find_switch_by_dpid(node->dpid);
+        
+        if (!sw) continue;
+        
+        // Collect all ports that are part of the MST
+        uint16_t mst_ports[MAX_SWITCH_PORTS];
+        int num_ports = 0;
+        
+        // Add parent port if this is not the root
+        if (node->dpid != tree->root_dpid && node->parent_port != 0) {
+            mst_ports[num_ports++] = node->parent_port;
+        }
+        
+        // Add all child ports
+        for (int j = 0; j < node->num_children; j++) {
+            if (node->child_ports && node->child_ports[j] != 0) {
+                mst_ports[num_ports++] = node->child_ports[j];
+            }
+        }
+        
+        // Install flow with multiple output actions
+        if (num_ports > 0) {
+            install_multiport_flow(sw, broadcast_mac, mst_ports, num_ports);
+            
+            log_msg("Installed broadcast flow on switch %016" PRIx64 " with %d output ports\n",
+                   node->dpid, num_ports);
+        }
+    }
+}
+
+// Install a flow with multiple output ports
+void install_multiport_flow(struct switch_info *sw, uint8_t *dst_mac, uint16_t *output_ports, int num_ports) {
+    int actions_len = num_ports * sizeof(struct ofp_action_output);
+    int total_len = sizeof(struct ofp_flow_mod) + actions_len;
+    
+    struct ofp_flow_mod *flow_mod = malloc(total_len);
+    memset(flow_mod, 0, total_len);
+    
+    // Fill in the ofp_header
+    flow_mod->header.version = OFP_VERSION;
+    flow_mod->header.type = OFPT_FLOW_MOD;
+    flow_mod->header.length = htons(total_len);
+    flow_mod->header.xid = htonl(0);
+    
+    // Set match on destination MAC
+    flow_mod->match.wildcards = htonl(OFPFW_ALL & ~OFPFW_DL_DST);
+    memcpy(flow_mod->match.dl_dst, dst_mac, OFP_ETH_ALEN);
+    
+    // Fill in flow mod fields
+    flow_mod->command = htons(OFPFC_ADD);
+    flow_mod->idle_timeout = htons(60);
+    flow_mod->hard_timeout = htons(300);
+    flow_mod->priority = htons(100);
+    flow_mod->buffer_id = htonl(0xFFFFFFFF);
+    flow_mod->out_port = htons(OFPP_NONE);
+    flow_mod->flags = htons(OFPFF_SEND_FLOW_REM);
+    
+    // Add output actions for each port
+    struct ofp_action_output *action = (struct ofp_action_output *)flow_mod->actions;
+    for (int i = 0; i < num_ports; i++) {
+        action[i].type = htons(OFPAT_OUTPUT);
+        action[i].len = htons(sizeof(struct ofp_action_output));
+        action[i].port = htons(output_ports[i]);
+        action[i].max_len = htons(0);
+    }
+    
+    send_openflow_msg(sw, flow_mod, total_len);
+    free(flow_mod);
+}
+
+// Helper function to find a switch by datapath ID
+struct switch_info *find_switch_by_dpid(uint64_t dpid) {
+    pthread_mutex_lock(&switches_lock);
+    
+    for (int i = 0; i < MAX_SWITCHES; i++) {
+        if (switches[i].active && switches[i].datapath_id == dpid) {
+            pthread_mutex_unlock(&switches_lock);
+            return &switches[i];
+        }
+    }
+    
+    pthread_mutex_unlock(&switches_lock);
+    return NULL;
+}
+
 void send_packet_out(struct switch_info *sw, uint8_t *data, size_t data_len, uint16_t out_port) {
 
     /* length calculations and allocations */

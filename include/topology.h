@@ -37,6 +37,38 @@ struct network_topology {
     pthread_mutex_t lock;    /* for thread safety */
 };
 
+// In topology.h
+struct path_node {
+    uint64_t dpid;
+    uint16_t in_port;
+    uint16_t out_port;
+    struct path_node *next;
+};
+
+struct path {
+    int length;
+    struct path_node *nodes;
+};
+
+struct mst_node {
+    uint64_t dpid;
+    uint64_t parent_dpid;
+    uint16_t parent_port;
+    int num_children;
+    uint16_t *child_ports;
+};
+
+struct mst {
+    uint64_t root_dpid;
+    int num_nodes;
+    struct mst_node *nodes;
+};
+
+// Function declarations
+struct path* calculate_shortest_path(uint64_t src_dpid, uint64_t dst_dpid);
+struct mst* calculate_mst(uint64_t root_dpid);
+struct topology_node* find_node(uint64_t dpid);
+
 /* milestone 2 prototypes */
 void init_topology();
 void *topology_discovery_loop(void *arg);

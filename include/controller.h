@@ -29,6 +29,7 @@
 #define ECHO_TIMEOUT       15    /* Connection is dead if no reply for 15 seconds */
 #define CLEANUP_INTERVAL   30
 #define MAC_ADDR_LEN 6
+#define MAX_SWITCH_PORTS 64
 
 #if defined(__linux__)
     #include <endian.h>

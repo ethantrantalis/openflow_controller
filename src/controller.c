@@ -306,89 +306,117 @@ void *accept_handler(void *arg) {
 /* handler for each connected switch, manages the lifecycle of a connection  */
 void *switch_handler(void *arg) {
     struct switch_info *sw = (struct switch_info *)arg;
-    uint8_t buf[OFP_MAX_MSG_SIZE];
-    ssize_t len;
-    time_t next_echo = 0;
-    time_t now;
     
-    printf("Switch handler started for new connection\n");
+    // Initialize the switch
+    if (!initialize_switch(sw)) {
+        cleanup_switch(sw);
+        return NULL;
+    }
     
-    /* initialize switch state */
+    // Main message handling loop
+    while (sw->active && running) {
+        if (!process_switch_messages(sw)) {
+            break;
+        }
+        
+        // Handle periodic tasks
+        handle_switch_periodic_tasks(sw);
+    }
+    
+    // Clean up
+    cleanup_switch(sw);
+    return NULL;
+}
+
+// Initialize a new switch connection
+bool initialize_switch(struct switch_info *sw) {
     sw->hello_received = 0;
     sw->features_received = 0;
     sw->last_echo_xid = 0;
     sw->echo_pending = false;
     
-    /* start OpenFlow handshake */
+    // Start OpenFlow handshake
     send_hello(sw);
     
-    /* message handling loop */
-    while (sw->active && running) {
-        struct timeval tv;
-        tv.tv_sec = 1; 
-        tv.tv_usec = 0;
+    return true;
+}
+
+// Process incoming messages from a switch
+bool process_switch_messages(struct switch_info *sw) {
+    struct timeval tv;
+    tv.tv_sec = 1;
+    tv.tv_usec = 0;
+    
+    fd_set readfds;
+    FD_ZERO(&readfds);
+    FD_SET(sw->socket, &readfds);
+    
+    int ret = select(sw->socket + 1, &readfds, NULL, NULL, &tv);
+    
+    if (ret < 0) {
+        if (errno == EINTR) {
+            return true; // Interrupted, but continue
+        }
+        log_msg("Error in select for switch %016" PRIx64 ": %s\n", 
+               sw->datapath_id, strerror(errno));
+        return false;
+    }
+    
+    if (ret > 0 && FD_ISSET(sw->socket, &readfds)) {
+        uint8_t buf[OFP_MAX_MSG_SIZE];
+        ssize_t len = recv(sw->socket, buf, sizeof(buf), 0);
         
-        fd_set readfds;
-        FD_ZERO(&readfds);
-        FD_SET(sw->socket, &readfds);
+        if (len == 0) {
+            log_msg("Connection closed cleanly by switch %016" PRIx64 "\n", 
+                   sw->datapath_id);
+            return false;
+        } else if (len < 0) {
+            if (errno == EINTR) {
+                return true; // Interrupted, but continue
+            } else if (errno == ECONNRESET) {
+                log_msg("Connection reset by switch %016" PRIx64 "\n", 
+                       sw->datapath_id);
+            } else {
+                log_msg("Receive error on switch %016" PRIx64 ": %s\n",
+                       sw->datapath_id, strerror(errno));
+            }
+            return false;
+        }
         
-        int ret = select(sw->socket + 1, &readfds, NULL, NULL, &tv);
+        // Process message
+        handle_switch_message(sw, buf, len);
+    }
+    
+    return true;
+}
+
+// Handle periodic tasks for a switch
+void handle_switch_periodic_tasks(struct switch_info *sw) {
+    time_t now = time(NULL);
+    
+    // Handle echo requests
+    if (sw->features_received) {
+        static time_t next_echo = 0;
         
-        now = time(NULL);
+        if (next_echo == 0) {
+            next_echo = now + ECHO_INTERVAL;
+        }
         
-        /* handle echo timing independent of message receipt */
-        if (sw->features_received) {
-            if (next_echo == 0) {
+        if (sw->echo_pending && (now - sw->last_echo) > ECHO_TIMEOUT) {
+            sw->echo_pending = false;
+            
+            // Consider the switch dead if it doesn't respond to echo
+            if (sw->last_echo_reply < sw->last_echo - ECHO_TIMEOUT) {
+                log_msg("Switch %016" PRIx64 " not responding to echo requests\n", 
+                       sw->datapath_id);
+                sw->active = 0;
+            }
+        }
+        
+        if (!sw->echo_pending && now >= next_echo) {
+            if (send_echo_request(sw)) {
                 next_echo = now + ECHO_INTERVAL;
             }
-            
-            if (sw->echo_pending && (now - sw->last_echo) > ECHO_TIMEOUT) {
-                sw->echo_pending = false;
-            }
-            
-            if (!sw->echo_pending && now >= next_echo) {
-                if (send_echo_request(sw)) {
-                    next_echo = now + ECHO_INTERVAL;
-                }
-            }
-        }
-        
-        /* handle incoming messages if any */
-        if (ret > 0 && FD_ISSET(sw->socket, &readfds)) {
-            len = recv(sw->socket, buf, sizeof(buf), 0);
-            if (len == 0) {
-                log_msg("Connection closed cleanly by switch %016" PRIx64 "\n", 
-                       sw->datapath_id);
-                break;
-            } else if (len < 0) {
-                if (errno == EINTR) {
-                    continue;
-                } else if (errno == ECONNRESET) {
-                    log_msg("Connection reset by switch %016" PRIx64 "\n", 
-                           sw->datapath_id);
-                } else {
-                    log_msg("Receive error on switch %016" PRIx64 ": %s\n",
-                           sw->datapath_id, strerror(errno));
-                }
-                break;
-            }
-            
-            /* process message */
-            handle_switch_message(sw, buf, len);
         }
     }
-    
-    /* clean up connection */
-    pthread_mutex_lock(&sw->lock);
-    if (sw->active) {
-        sw->active = 0;
-        close(sw->socket);
-        free(sw->ports);
-        sw->ports = NULL;
-        sw->num_ports = 0;
-    }
-    pthread_mutex_unlock(&sw->lock);
-    
-    printf("Switch handler exiting\n");
-    return NULL;
 }

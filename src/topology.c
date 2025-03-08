@@ -384,39 +384,353 @@ void topology_remove_link(uint64_t dpid, uint16_t port_no){
 
 /* -------------------------------------------------------- Path Calculation Functions ----------------------------------------- */
 
-struct mac_entry * calculate_path(struct mac_entry * final_dst){
 
-    /* find the source switch */
-    struct mac_entry * src = find_mac(final_dst->mac);
-    if (src == NULL){
-        log_msg("Error: Source MAC not found in MAC table\n");
+// In topology.c
+
+// Add this function to find the shortest path using Dijkstra's algorithm
+struct path* calculate_shortest_path(uint64_t src_dpid, uint64_t dst_dpid) {
+    pthread_mutex_lock(&global_topology.lock);
+    
+    // Create distance and visited tracking
+    struct distance_entry {
+        uint64_t dpid;
+        int distance;
+        uint64_t prev_dpid;
+        uint16_t prev_port;
+        uint16_t next_port;
+        bool visited;
+    };
+    
+    // Initialize distances
+    struct distance_entry *distances = malloc(global_topology.num_nodes * sizeof(struct distance_entry));
+    if (!distances) {
+        log_msg("Error: Failed to allocate memory for Dijkstra's algorithm\n");
+        pthread_mutex_unlock(&global_topology.lock);
         return NULL;
     }
+    
+    int count = 0;
+    struct topology_node *node = global_topology.nodes;
+    
+    // Initialize all nodes with infinite distance
+    while (node != NULL) {
+        distances[count].dpid = node->dpid;
+        distances[count].distance = INT_MAX;
+        distances[count].prev_dpid = 0;
+        distances[count].prev_port = 0;
+        distances[count].next_port = 0;
+        distances[count].visited = false;
+        
+        // Set source distance to 0
+        if (node->dpid == src_dpid) {
+            distances[count].distance = 0;
+        }
+        
+        count++;
+        node = node->next;
+    }
+    
+    // Dijkstra's algorithm
+    for (int i = 0; i < global_topology.num_nodes; i++) {
+        // Find node with minimum distance
+        int min_dist = INT_MAX;
+        int min_idx = -1;
+        
+        for (int j = 0; j < global_topology.num_nodes; j++) {
+            if (!distances[j].visited && distances[j].distance < min_dist) {
+                min_dist = distances[j].distance;
+                min_idx = j;
+            }
+        }
+        
+        if (min_idx == -1) break; // No reachable nodes left
+        
+        // Mark as visited
+        distances[min_idx].visited = true;
+        
+        // Find the node in the topology
+        struct topology_node *current = find_node(distances[min_idx].dpid);
+        if (!current) continue;
+        
+        // Check all adjacent nodes
+        struct topology_link *link = current->links;
+        while (link != NULL) {
+            // Find the adjacent node in our distances array
+            int adj_idx = -1;
+            for (int j = 0; j < global_topology.num_nodes; j++) {
+                if (distances[j].dpid == link->linked_dpid) {
+                    adj_idx = j;
+                    break;
+                }
+            }
+            
+            if (adj_idx != -1 && !distances[adj_idx].visited) {
+                // Update distance if shorter path found
+                int alt_dist = distances[min_idx].distance + 1; // Assuming all links have weight 1
+                if (alt_dist < distances[adj_idx].distance) {
+                    distances[adj_idx].distance = alt_dist;
+                    distances[adj_idx].prev_dpid = distances[min_idx].dpid;
+                    distances[adj_idx].prev_port = link->node_port;
+                    
+                    // Find the port on the destination that connects back
+                    struct topology_node *adj_node = find_node(link->linked_dpid);
+                    if (adj_node) {
+                        struct topology_link *adj_link = adj_node->links;
+                        while (adj_link != NULL) {
+                            if (adj_link->linked_dpid == current->dpid) {
+                                distances[adj_idx].next_port = adj_link->node_port;
+                                break;
+                            }
+                            adj_link = adj_link->next;
+                        }
+                    }
+                }
+            }
+            
+            link = link->next;
+        }
+    }
+    
+    // Construct the path from source to destination
+    struct path *result = NULL;
+    
+    // Find destination in distances
+    int dst_idx = -1;
+    for (int i = 0; i < global_topology.num_nodes; i++) {
+        if (distances[i].dpid == dst_dpid) {
+            dst_idx = i;
+            break;
+        }
+    }
+    
+    if (dst_idx != -1 && distances[dst_idx].distance != INT_MAX) {
+        // Reconstruct path
+        struct path_node *path_head = NULL;
+        uint64_t current_dpid = dst_dpid;
+        
+        while (current_dpid != src_dpid) {
+            // Find current node in distances
+            int curr_idx = -1;
+            for (int i = 0; i < global_topology.num_nodes; i++) {
+                if (distances[i].dpid == current_dpid) {
+                    curr_idx = i;
+                    break;
+                }
+            }
+            
+            if (curr_idx == -1) break; // Error in path
+            
+            // Add to path
+            struct path_node *node = malloc(sizeof(struct path_node));
+            if (!node) {
+                log_msg("Error: Failed to allocate memory for path node\n");
+                break;
+            }
+            
+            node->dpid = current_dpid;
+            node->in_port = distances[curr_idx].next_port;
+            node->out_port = distances[curr_idx].prev_port;
+            node->next = path_head;
+            path_head = node;
+            
+            current_dpid = distances[curr_idx].prev_dpid;
+        }
+        
+        // Add source node
+        struct path_node *src_path_node = malloc(sizeof(struct path_node));
+        if (src_path_node) {
+            src_path_node->dpid = src_dpid;
+            src_path_node->in_port = 0; // Not used for source
+            if (path_head)
+                src_path_node->out_port = path_head->in_port;
+            else
+                src_path_node->out_port = 0;
+            src_path_node->next = path_head;
+            path_head = src_path_node;
+        }
+        
+        // Create the result
+        result = malloc(sizeof(struct path));
+        if (result) {
+            result->length = distances[dst_idx].distance + 1;
+            result->nodes = path_head;
+        }
+    }
+    
+    free(distances);
+    pthread_mutex_unlock(&global_topology.lock);
+    return result;
+}
 
-    /* find the destination switch */
-    struct mac_entry * dst = find_mac(final_dst->mac);
-    if (dst == NULL){
-        log_msg("Error: Destination MAC not found in MAC table\n");
+// Add this function to calculate a Minimum Spanning Tree
+struct mst* calculate_mst(uint64_t root_dpid) {
+    pthread_mutex_lock(&global_topology.lock);
+    
+    // Create structures for MST calculation (Prim's algorithm)
+    struct mst_entry {
+        uint64_t dpid;
+        bool in_mst;
+        uint64_t parent_dpid;
+        uint16_t parent_port;
+        uint16_t child_port;
+    };
+    
+    // Initialize MST entries
+    struct mst_entry *mst_nodes = malloc(global_topology.num_nodes * sizeof(struct mst_entry));
+    if (!mst_nodes) {
+        log_msg("Error: Failed to allocate memory for MST calculation\n");
+        pthread_mutex_unlock(&global_topology.lock);
         return NULL;
     }
-
-    /* find the shortest path between the two switches */
-    struct path * path = dijkstras(src->dpid, dst->dpid);
-
-    /* create a new mac entry to store the path */
-    struct mac_entry * path_entry = malloc(sizeof(struct mac_entry));
-    if (path_entry == NULL){
-        log_msg("Error: Failed to allocate memory for path entry\n");
+    
+    int count = 0;
+    struct topology_node *node = global_topology.nodes;
+    
+    // Initialize all nodes
+    while (node != NULL) {
+        mst_nodes[count].dpid = node->dpid;
+        mst_nodes[count].in_mst = false;
+        mst_nodes[count].parent_dpid = 0;
+        mst_nodes[count].parent_port = 0;
+        mst_nodes[count].child_port = 0;
+        
+        // Set root node as first node in MST
+        if (node->dpid == root_dpid) {
+            mst_nodes[count].in_mst = true;
+        }
+        
+        count++;
+        node = node->next;
+    }
+    
+    // Prim's algorithm
+    int nodes_in_mst = 1; // Start with root
+    
+    while (nodes_in_mst < global_topology.num_nodes) {
+        int min_weight = INT_MAX;
+        int min_src_idx = -1;
+        int min_dst_idx = -1;
+        uint16_t min_src_port = 0;
+        uint16_t min_dst_port = 0;
+        
+        // Find the minimum weight edge from MST to non-MST vertex
+        for (int i = 0; i < global_topology.num_nodes; i++) {
+            if (mst_nodes[i].in_mst) {
+                // Find the node in the topology
+                struct topology_node *current = find_node(mst_nodes[i].dpid);
+                if (!current) continue;
+                
+                // Check all adjacent nodes
+                struct topology_link *link = current->links;
+                while (link != NULL) {
+                    // Find the adjacent node in our MST array
+                    int adj_idx = -1;
+                    for (int j = 0; j < global_topology.num_nodes; j++) {
+                        if (mst_nodes[j].dpid == link->linked_dpid) {
+                            adj_idx = j;
+                            break;
+                        }
+                    }
+                    
+                    if (adj_idx != -1 && !mst_nodes[adj_idx].in_mst) {
+                        // Assuming all links have weight 1 for simplicity
+                        int weight = 1;
+                        
+                        if (weight < min_weight) {
+                            min_weight = weight;
+                            min_src_idx = i;
+                            min_dst_idx = adj_idx;
+                            min_src_port = link->node_port;
+                            
+                            // Find the port on the destination that connects back
+                            struct topology_node *adj_node = find_node(link->linked_dpid);
+                            if (adj_node) {
+                                struct topology_link *adj_link = adj_node->links;
+                                while (adj_link != NULL) {
+                                    if (adj_link->linked_dpid == current->dpid) {
+                                        min_dst_port = adj_link->node_port;
+                                        break;
+                                    }
+                                    adj_link = adj_link->next;
+                                }
+                            }
+                        }
+                    }
+                    
+                    link = link->next;
+                }
+            }
+        }
+        
+        if (min_src_idx != -1 && min_dst_idx != -1) {
+            // Add the minimum edge to MST
+            mst_nodes[min_dst_idx].in_mst = true;
+            mst_nodes[min_dst_idx].parent_dpid = mst_nodes[min_src_idx].dpid;
+            mst_nodes[min_dst_idx].parent_port = min_dst_port;
+            mst_nodes[min_dst_idx].child_port = min_src_port;
+            nodes_in_mst++;
+        } else {
+            // Graph is not fully connected
+            break;
+        }
+    }
+    
+    // Construct the MST result
+    struct mst *result = malloc(sizeof(struct mst));
+    if (!result) {
+        free(mst_nodes);
+        pthread_mutex_unlock(&global_topology.lock);
         return NULL;
     }
-
-    /* copy the destination mac address */
-    memcpy(path_entry->mac, final_dst->mac, MAC_ADDR_LEN);
-
-    /* copy the path into the mac entry */
-    path_entry->path = path;
-
-    return path_entry;
-
-
+    
+    result->root_dpid = root_dpid;
+    result->num_nodes = nodes_in_mst;
+    
+    // Create array of MST nodes
+    result->nodes = malloc(nodes_in_mst * sizeof(struct mst_node));
+    if (!result->nodes) {
+        free(result);
+        free(mst_nodes);
+        pthread_mutex_unlock(&global_topology.lock);
+        return NULL;
+    }
+    
+    // Fill in the MST nodes
+    int mst_idx = 0;
+    for (int i = 0; i < global_topology.num_nodes && mst_idx < nodes_in_mst; i++) {
+        if (mst_nodes[i].in_mst) {
+            result->nodes[mst_idx].dpid = mst_nodes[i].dpid;
+            result->nodes[mst_idx].parent_dpid = mst_nodes[i].parent_dpid;
+            result->nodes[mst_idx].parent_port = mst_nodes[i].parent_port;
+            
+            // Count and collect children
+            int child_count = 0;
+            for (int j = 0; j < global_topology.num_nodes; j++) {
+                if (mst_nodes[j].in_mst && mst_nodes[j].parent_dpid == mst_nodes[i].dpid) {
+                    child_count++;
+                }
+            }
+            
+            result->nodes[mst_idx].num_children = child_count;
+            if (child_count > 0) {
+                result->nodes[mst_idx].child_ports = malloc(child_count * sizeof(uint16_t));
+                if (result->nodes[mst_idx].child_ports) {
+                    int cp_idx = 0;
+                    for (int j = 0; j < global_topology.num_nodes && cp_idx < child_count; j++) {
+                        if (mst_nodes[j].in_mst && mst_nodes[j].parent_dpid == mst_nodes[i].dpid) {
+                            result->nodes[mst_idx].child_ports[cp_idx++] = mst_nodes[j].child_port;
+                        }
+                    }
+                }
+            } else {
+                result->nodes[mst_idx].child_ports = NULL;
+            }
+            
+            mst_idx++;
+        }
+    }
+    
+    free(mst_nodes);
+    pthread_mutex_unlock(&global_topology.lock);
+    return result;
 }
