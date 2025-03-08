@@ -96,7 +96,11 @@ int main(int argc, char *argv[]);
 void init_controller(int port);
 void *accept_handler(void *arg);
 void *switch_handler(void *arg);
+bool initialize_switch(struct switch_info *sw);
+bool process_switch_messages(struct switch_info *sw);
+void handle_switch_periodic_tasks(struct switch_info *sw);
 void cleanup_switch(struct switch_info *sw);
+void handle_switch_disconnection(struct switch_info *sw);
 
 /* mac table functions */
 struct mac_entry *find_mac(uint8_t *mac);

@@ -316,12 +316,16 @@ void *switch_handler(void *arg) {
     // Main message handling loop
     while (sw->active && running) {
         if (!process_switch_messages(sw)) {
+
+            handle_switch_disconnection(sw);
             break;
         }
         
         // Handle periodic tasks
         handle_switch_periodic_tasks(sw);
     }
+
+
     
     // Clean up
     cleanup_switch(sw);
@@ -405,11 +409,12 @@ void handle_switch_periodic_tasks(struct switch_info *sw) {
         if (sw->echo_pending && (now - sw->last_echo) > ECHO_TIMEOUT) {
             sw->echo_pending = false;
             
-            // Consider the switch dead if it doesn't respond to echo
+            // If no echo response and timeout exceeded, handle disconnection
             if (sw->last_echo_reply < sw->last_echo - ECHO_TIMEOUT) {
                 log_msg("Switch %016" PRIx64 " not responding to echo requests\n", 
                        sw->datapath_id);
-                sw->active = 0;
+                handle_switch_disconnection(sw);
+                sw->active = 0; // Signal the main loop to exit
             }
         }
         
@@ -419,4 +424,94 @@ void handle_switch_periodic_tasks(struct switch_info *sw) {
             }
         }
     }
+}
+
+// Function to handle switch disconnection
+void handle_switch_disconnection(struct switch_info *sw) {
+    // Log the disconnection
+    log_msg("Switch %016" PRIx64 " disconnected, cleaning up resources\n", sw->datapath_id);
+    
+    
+    pthread_mutex_lock(&sw->lock);
+    sw->active = 0;
+    pthread_mutex_unlock(&sw->lock);
+    
+    
+    pthread_mutex_lock(&global_topology.lock);
+    struct topology_node *node = global_topology.nodes;
+    struct topology_node *prev = NULL;
+    
+    // Find and remove the node for this switch
+    while (node != NULL) {
+        if (node->dpid == sw->datapath_id) {
+            // Remove all links
+            while (node->links != NULL) {
+                struct topology_link *link = node->links;
+                node->links = link->next;
+                free(link);
+            }
+            
+            // Remove node from list
+            if (prev == NULL) {
+                global_topology.nodes = node->next;
+            } else {
+                prev->next = node->next;
+            }
+            
+            global_topology.num_nodes--;
+            free(node);
+            break;
+        }
+        prev = node;
+        node = node->next;
+    }
+    
+    
+    node = global_topology.nodes;
+    while (node != NULL) {
+        struct topology_link *link = node->links;
+        struct topology_link *prev_link = NULL;
+        
+        while (link != NULL) {
+            if (link->linked_dpid == sw->datapath_id) {
+                // Remove this link
+                if (prev_link == NULL) {
+                    node->links = link->next;
+                } else {
+                    prev_link->next = link->next;
+                }
+                
+                struct topology_link *to_free = link;
+                link = link->next;
+                free(to_free);
+                node->num_links--;
+                global_topology.num_links--;
+            } else {
+                prev_link = link;
+                link = link->next;
+            }
+        }
+        
+        node = node->next;
+    }
+    pthread_mutex_unlock(&global_topology.lock);
+    
+    
+    struct mac_entry *entry, *tmp;
+    HASH_ITER(hh, mac_table, entry, tmp) {
+        if (entry->switch_dpid == sw->datapath_id) {
+            HASH_DEL(mac_table, entry);
+            free(entry);
+        }
+    }
+    
+    
+    close(sw->socket);
+    free(sw->ports);
+    sw->ports = NULL;
+    sw->num_ports = 0;
+    
+    // 5. Notify the controller about topology change
+    log_msg("Topology updated after switch %016" PRIx64 " disconnection\n", 
+            sw->datapath_id);
 }

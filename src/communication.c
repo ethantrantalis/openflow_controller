@@ -90,6 +90,10 @@ void handle_features_reply(struct switch_info *sw, struct ofp_switch_features *f
     
     /* store port information */
     sw->ports = malloc(port_list_len);
+    if(sw->ports == NULL) {
+        log_msg("Error: Failed to allocate memory for ports\n");
+        return;
+    }
     if (sw->ports) {
         memcpy(sw->ports, features->ports, port_list_len);
         sw->num_ports = num_ports;
@@ -205,7 +209,6 @@ void handle_port_status(struct switch_info *sw, struct ofp_port_status *ps) {
             if (!(ntohl(port->state) & OFPPS_LINK_DOWN)) { /* port is down */
                 /* UPDATE THE LINK STATUS */
                 topology_remove_link(sw->datapath_id, ntohs(port->port_no));
-                send_lldp_packet(sw, ntohs(port->port_no));
             } else { /* port is up */
                 /* UPDATE THE LINK STATUS */
                 topology_remove_link(sw->datapath_id, ntohs(port->port_no));
@@ -234,8 +237,9 @@ void handle_port_status(struct switch_info *sw, struct ofp_port_status *ps) {
 
 /* --------------------------------------------------- Flow Installation ------------------------------------------------------- */
 
-/* handle incoming packets from the switch */
+
 void handle_packet_in(struct switch_info *sw, struct ofp_packet_in *pi) {
+
     /*
     Case 1: Unicast to Same Switch
     When source and destination MAC addresses are on the same switch:
@@ -261,82 +265,160 @@ void handle_packet_in(struct switch_info *sw, struct ofp_packet_in *pi) {
     Action will indeed be to output to MULTIPLE ports (all ports in the MST except the input port)
     For this, you'll need to construct a flow rule with multiple actions
     */
-
     if (!pi) {
         log_msg("Error: Null packet_in message\n");
         return;
     }
 
-    /* first check for an lldp packet - see topology.c  */
+    /* First check for an LLDP packet - for topology discovery */
     if (is_lldp_packet(pi->data)) {
         handle_lldp_packet(sw, pi);
-        return;  /* no further processing for LLDP packets */
+        return;  /* No further processing for LLDP packets */
     }
 
-    /* extract ethernet frame information */
+    /* Extract ethernet frame information */
     uint8_t *eth_frame_start = pi->data;
     uint8_t *eth_dst = eth_frame_start;
     uint8_t *eth_src = eth_frame_start + ETHERNET_ADDR_LEN;
 
-    /* add info from packet to global MAC table */
+    /* Add source MAC to global MAC table */
     add_mac(eth_src, sw->datapath_id, ntohs(pi->in_port));
     
-    /* lock switch for thread safety while accessing switch info */
-    pthread_mutex_lock(&sw->lock);
-    
-    /* increment packet counter */
-    sw->packet_in_count++;
-    
-    /* extract basic packet information */
-    uint32_t buffer_id = ntohl(pi->buffer_id);
+    /* Extract packet information */
     uint16_t total_len = ntohs(pi->total_len);
     uint16_t in_port = ntohs(pi->in_port);
     
-    /* get reason for packet in */
-    const char *reason_str = "Unknown";
-    switch (pi->reason) {
-        case OFPR_NO_MATCH:
-            if (memcmp(eth_dst, eth_src, ETHERNET_ADDR_LEN) == 0) {
-
-                /* DIJKSTAS CALCULATION */
-                /* INSTALL FLOW WITH TO FORWARD TO SELF */
-                /* PACKEY OUT WITH pi */
-
-                reason_str = "UNICAST, SAME SRC AND DST";
-            } else if (memcmp(eth_dst, "\xff\xff\xff\xff\xff\xff", ETHERNET_ADDR_LEN) == 0) {
-
-                /* MST CALCULATION */
-                /* INSTALL FLOW FOR BROADCAST */
-                /* PACKET OUT WITH pi */
-
-                reason_str = "BROADCAST";
-            } else {
-
-                /* DIJKSTAS CALCULATION */
-                /* INSTALL FLOW WITH TO FORWARD TO NEXT HOP */
-                /* PACKET OUT WITH pi */
-
-                reason_str = "UNICAST, DIFFERENT SRC AND DST";
-            }
-            break;
-        case OFPR_ACTION:
-            reason_str = "Action explicitly output to controller";
-            break;
-        default:
-            reason_str = "Unknown reason";
-    }
-    
-    /* log packet information */
-    #ifdef DEBUG
-    log_msg("\nPACKET_IN from switch %016" PRIx64 ":\n", sw->datapath_id);
-    log_msg("  Buffer ID: %u\n", buffer_id);
-    log_msg("  Total Length: %u bytes\n", total_len);
-    log_msg("  In Port: %u\n", in_port);
-    log_msg("  Reason: %s\n", reason_str);
-    #endif
-
-    
+    /* Increment packet counter */
+    pthread_mutex_lock(&sw->lock);
+    sw->packet_in_count++;
     pthread_mutex_unlock(&sw->lock);
+    
+    log_msg("PACKET_IN from switch %016" PRIx64 ", port %u, size %u bytes\n", 
+            sw->datapath_id, in_port, total_len);
+    
+    /* Check if it's a broadcast/multicast packet */
+    if (eth_dst[0] & 0x01) {  /* LSB of first octet = 1 for multicast/broadcast */
+        log_msg("Handling broadcast/multicast packet\n");
+        
+        /* Calculate MST with current switch as root */
+        struct mst *tree = calculate_mst(sw->datapath_id);
+        if (tree) {
+            /* Install broadcast flow rules */
+            install_broadcast_flows(tree, eth_dst);
+            
+            /* Send packet_out to broadcast the current packet */
+            /* Find all output ports from MST */
+            uint16_t out_ports[MAX_SWITCH_PORTS];
+            int num_ports = 0;
+            
+            /* Find this switch in the MST */
+            for (int i = 0; i < tree->num_nodes; i++) {
+                if (tree->nodes[i].dpid == sw->datapath_id) {
+                    /* Add all child ports */
+                    for (int j = 0; j < tree->nodes[i].num_children; j++) {
+                        if (tree->nodes[i].child_ports && 
+                            tree->nodes[i].child_ports[j] != 0 &&
+                            tree->nodes[i].child_ports[j] != in_port) { /* Don't send back on input port */
+                            out_ports[num_ports++] = tree->nodes[i].child_ports[j];
+                        }
+                    }
+                    
+                    /* Add parent port if not the root */
+                    if (tree->nodes[i].dpid != tree->root_dpid && 
+                        tree->nodes[i].parent_port != 0 &&
+                        tree->nodes[i].parent_port != in_port) { /* Don't send back on input port */
+                        out_ports[num_ports++] = tree->nodes[i].parent_port;
+                    }
+                    break;
+                }
+            }
+            
+            /* Forward the packet out all ports */
+            for (int i = 0; i < num_ports; i++) {
+                send_packet_out(sw, pi->data, total_len, out_ports[i]);
+                log_msg("Forwarding broadcast packet out port %u\n", out_ports[i]);
+            }
+            
+            /* Free MST resources */
+            for (int i = 0; i < tree->num_nodes; i++) {
+                if (tree->nodes[i].child_ports) {
+                    free(tree->nodes[i].child_ports);
+                }
+            }
+            if (tree) {
+                if (tree->nodes) free(tree->nodes);
+                free(tree);
+            }
+        }
+    } else {
+        /* Unicast packet - lookup destination MAC */
+        struct mac_entry *dst_entry = find_mac(eth_dst);
+        
+        if (dst_entry) {
+            if (dst_entry->switch_dpid == sw->datapath_id) {
+                /* Case 1: Destination MAC is on the same switch */
+                log_msg("Destination MAC is on the same switch, port %u\n", dst_entry->port);
+                
+                /* Install flow rule from input port to destination port */
+                send_flow_mod(sw, eth_dst, dst_entry->port);
+                
+                /* Forward the current packet */
+                send_packet_out(sw, pi->data, total_len, dst_entry->port);
+                
+            } else {
+                /* Case 2: Destination MAC is on a different switch */
+                log_msg("Destination MAC is on switch %016" PRIx64 ", port %u\n", 
+                        dst_entry->switch_dpid, dst_entry->port);
+                
+                /* Calculate shortest path to the destination switch */
+                struct path *path = calculate_shortest_path(sw->datapath_id, dst_entry->switch_dpid);
+                if (path) {
+                    /* Install flows along the path */
+                    install_unicast_flows(path, eth_dst);
+                    
+                    /* Forward the current packet out the first hop */
+                    struct path_node *first_node = path->nodes;
+                    if (first_node && first_node->out_port != 0) {
+                        send_packet_out(sw, pi->data, total_len, first_node->out_port);
+                        log_msg("Forwarding packet toward destination switch via port %u\n", 
+                                first_node->out_port);
+                    }
+                    
+                    /* Free path resources */
+                    struct path_node *node = path->nodes;
+                    while (node) {
+                        struct path_node *next = node->next;
+                        free(node);
+                        node = next;
+                    }
+                    free(path);
+                } else {
+                    log_msg("Failed to calculate path to destination switch\n");
+                }
+            }
+        } else {
+            /* Unknown destination MAC - flood the packet */
+            log_msg("Unknown destination MAC, flooding\n");
+            
+            /* Similar to broadcast, but we'll just flood to all ports */
+            for (int i = 0; i < sw->num_ports; i++) {
+                uint16_t port_no = ntohs(sw->ports[i].port_no);
+                
+                /* Skip non-physical ports and input port */
+                if (port_no >= OFPP_MAX || port_no == in_port) {
+                    continue;
+                }
+                
+                /* Skip ports that are down */
+                if (ntohl(sw->ports[i].state) & OFPPS_LINK_DOWN) {
+                    continue;
+                }
+                
+                send_packet_out(sw, pi->data, total_len, port_no);
+                log_msg("Flooding packet out port %u\n", port_no);
+            }
+        }
+    }
 }
 
 void send_flow_mod(struct switch_info *sw, uint8_t *dst_mac, uint16_t output_port) {
@@ -346,6 +428,10 @@ void send_flow_mod(struct switch_info *sw, uint8_t *dst_mac, uint16_t output_por
     int total_len = sizeof(struct ofp_flow_mod) + actions_len;
 
     struct ofp_flow_mod *flow_mod = malloc(total_len);
+    if (!flow_mod) {
+        log_msg("Error: Failed to allocate memory for flow mod\n");
+        return;
+    }
     memset(flow_mod, 0, total_len);
     
     /* fill in the ofp_header */
@@ -380,7 +466,20 @@ void send_flow_mod(struct switch_info *sw, uint8_t *dst_mac, uint16_t output_por
     free(flow_mod);
 }
 
-// In communication.c
+// Helper function to find a switch by datapath ID
+struct switch_info *find_switch_by_dpid(uint64_t dpid) {
+    pthread_mutex_lock(&switches_lock);
+    
+    for (int i = 0; i < MAX_SWITCHES; i++) {
+        if (switches[i].active && switches[i].datapath_id == dpid) {
+            pthread_mutex_unlock(&switches_lock);
+            return &switches[i];
+        }
+    }
+    
+    pthread_mutex_unlock(&switches_lock);
+    return NULL;
+}
 
 // Install flow for unicast traffic along a path
 void install_unicast_flows(struct path *path, uint8_t *dst_mac) {
@@ -448,6 +547,11 @@ void install_multiport_flow(struct switch_info *sw, uint8_t *dst_mac, uint16_t *
     int total_len = sizeof(struct ofp_flow_mod) + actions_len;
     
     struct ofp_flow_mod *flow_mod = malloc(total_len);
+    if (!flow_mod) {
+        log_msg("Error: Failed to allocate memory for multiport flow mod\n");
+        return;
+    }
+    
     memset(flow_mod, 0, total_len);
     
     // Fill in the ofp_header
@@ -482,27 +586,11 @@ void install_multiport_flow(struct switch_info *sw, uint8_t *dst_mac, uint16_t *
     free(flow_mod);
 }
 
-// Helper function to find a switch by datapath ID
-struct switch_info *find_switch_by_dpid(uint64_t dpid) {
-    pthread_mutex_lock(&switches_lock);
-    
-    for (int i = 0; i < MAX_SWITCHES; i++) {
-        if (switches[i].active && switches[i].datapath_id == dpid) {
-            pthread_mutex_unlock(&switches_lock);
-            return &switches[i];
-        }
-    }
-    
-    pthread_mutex_unlock(&switches_lock);
-    return NULL;
-}
-
 void send_packet_out(struct switch_info *sw, uint8_t *data, size_t data_len, uint16_t out_port) {
 
     /* length calculations and allocations */
     int total_len = sizeof(struct ofp_packet_out) + data_len;
     struct ofp_packet_out *packet_out = malloc(total_len);
-
     if (!packet_out) {
         log_msg("Failed to allocate memory for packet out message\n");
         return;

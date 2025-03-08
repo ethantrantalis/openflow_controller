@@ -60,6 +60,7 @@ void init_topology() {
         perror("Failed to create topology thread");
         exit(1);
     }
+
 }
 
 void *topology_discovery_loop(void *arg) {
@@ -94,13 +95,27 @@ void *topology_discovery_loop(void *arg) {
         pthread_mutex_unlock(&switches_lock);
         
         /* clean up stale links */
-        // topology_cleanup_stale_links();
+        topology_cleanup_stale_links();
         
         /* sleep before next discovery round */
         sleep(TOPOLOGY_DISCOVERY_INTERVAL); 
     }
+
+
     
-    log_msg("Topology discovery thread exiting\n");
+    printf("Topology discovery thread exiting\n");
+
+    while(global_topology.nodes != NULL){
+        struct topology_node *node = global_topology.nodes;
+        global_topology.nodes = node->next;
+        while(node->links != NULL){
+            struct topology_link *link = node->links;
+            node->links = link->next;
+            free(link);
+        }
+        free(node);
+    }
+    printf("Freed global topology\n");
     return NULL;
 }
 
@@ -140,6 +155,10 @@ void send_lldp_packet(struct switch_info *sw, uint16_t port_no) {
     /* create the packet_out message */
     int total_len = sizeof(struct ofp_packet_out) + sizeof(output) + packet_size;
     struct ofp_packet_out *po = malloc(total_len); /* oversized malloc for space after packet out */
+    if (!po) {
+        log_msg("Error: Failed to allocate memory for packet_out message\n");
+        return;
+    }
     memset(po, 0, total_len);
     po->header.version = OFP_VERSION;
     po->header.type = OFPT_PACKET_OUT;
@@ -360,13 +379,14 @@ void topology_remove_link(uint64_t dpid, uint16_t port_no){
                 } else {
                     prev->next = next->next; /* set previous link to point to next link */
                 }
-                free(next);
-                node->num_links--;
-                global_topology.num_links--;
+                
                 #ifdef DEBUG
                 log_msg("Removed link from switch %016" PRIx64 " port %u to switch %016" PRIx64 " port %u\n",
                                                         dpid, port_no, next->linked_dpid, next->linked_port);
                 #endif
+                free(next);
+                node->num_links--;
+                global_topology.num_links--;
                 break;
             }
             prev = next;
@@ -384,8 +404,6 @@ void topology_remove_link(uint64_t dpid, uint16_t port_no){
 
 /* -------------------------------------------------------- Path Calculation Functions ----------------------------------------- */
 
-
-// In topology.c
 
 // Add this function to find the shortest path using Dijkstra's algorithm
 struct path* calculate_shortest_path(uint64_t src_dpid, uint64_t dst_dpid) {
@@ -547,13 +565,32 @@ struct path* calculate_shortest_path(uint64_t src_dpid, uint64_t dst_dpid) {
                 src_path_node->out_port = 0;
             src_path_node->next = path_head;
             path_head = src_path_node;
+        } else {
+            log_msg("Error: Failed to allocate memory for source path node\n");
+            struct path_node *node = path_head;
+            while (node) {
+                struct path_node *next = node->next;
+                free(node);
+                node = next;
+            }
         }
         
         // Create the result
         result = malloc(sizeof(struct path));
+
         if (result) {
             result->length = distances[dst_idx].distance + 1;
             result->nodes = path_head;
+        } else {
+
+            // Free the path nodes
+            log_msg("Error: Failed to allocate memory for path result");
+            struct path_node *node = path_head;
+            while (node) {
+                struct path_node *next = node->next;
+                free(node);
+                node = next;
+            }
         }
     }
     
@@ -678,6 +715,7 @@ struct mst* calculate_mst(uint64_t root_dpid) {
     // Construct the MST result
     struct mst *result = malloc(sizeof(struct mst));
     if (!result) {
+        log_msg("Error: Failed to allocate memory for MST result");
         free(mst_nodes);
         pthread_mutex_unlock(&global_topology.lock);
         return NULL;
@@ -689,6 +727,7 @@ struct mst* calculate_mst(uint64_t root_dpid) {
     // Create array of MST nodes
     result->nodes = malloc(nodes_in_mst * sizeof(struct mst_node));
     if (!result->nodes) {
+        log_msg("Error: Failed to allocate memory for MST nodes");
         free(result);
         free(mst_nodes);
         pthread_mutex_unlock(&global_topology.lock);
@@ -714,6 +753,14 @@ struct mst* calculate_mst(uint64_t root_dpid) {
             result->nodes[mst_idx].num_children = child_count;
             if (child_count > 0) {
                 result->nodes[mst_idx].child_ports = malloc(child_count * sizeof(uint16_t));
+                if(!result->nodes[mst_idx].child_ports) {
+                    log_msg("Error: Failed to allocate memory for MST child ports");
+                    free(result->nodes);
+                    free(result);
+                    free(mst_nodes);
+                    pthread_mutex_unlock(&global_topology.lock);
+                    return NULL;
+                }
                 if (result->nodes[mst_idx].child_ports) {
                     int cp_idx = 0;
                     for (int j = 0; j < global_topology.num_nodes && cp_idx < child_count; j++) {
@@ -733,4 +780,21 @@ struct mst* calculate_mst(uint64_t root_dpid) {
     free(mst_nodes);
     pthread_mutex_unlock(&global_topology.lock);
     return result;
+}
+
+/* Find a node in the topology by datapath ID */
+struct topology_node* find_node(uint64_t dpid) {
+    pthread_mutex_lock(&global_topology.lock);
+    
+    struct topology_node *current = global_topology.nodes;
+    while (current != NULL) {
+        if (current->dpid == dpid) {
+            pthread_mutex_unlock(&global_topology.lock);
+            return current;
+        }
+        current = current->next;
+    }
+    
+    pthread_mutex_unlock(&global_topology.lock);
+    return NULL; /* Node not found */
 }
