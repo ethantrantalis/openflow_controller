@@ -113,7 +113,6 @@ void handle_switch_join(struct switch_info *sw);
 void handle_switch_disconnect(struct switch_info *sw); 
 void handle_port_change(struct switch_info *sw, uint16_t src_port_no, bool is_up); 
 
-igraph_integer_t find_vertex_by_dpid(uint64_t dpid); 
 void add_or_update_link(uint64_t src_dpid, uint16_t src_port, uint64_t dst_dpid, uint16_t dst_port);
 void add_vertex(uint64_t dpid); 
 void remove_links_for_port(uint64_t dpid, uint16_t src_port_no);

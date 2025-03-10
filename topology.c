@@ -41,9 +41,9 @@ void handle_switch_join(struct switch_info *sw) {
     pthread_mutex_lock(&topology.lock);
     
     /* add switch to topology if not exists */
-    igraph_integer_t vertex_id = find_vertex_by_dpid(sw->datapath_id);
+    igraph_integer_t vertex_id = VECTOR(topology.dpid_to_vertex)[sw->datapath_id];
 
-    if (vertex_id == -1) { /* does not exist in the topology yet */
+    if (vertex_id < 0) { /* does not exist in the topology yet */
         add_vertex(sw->datapath_id);
         
     }
@@ -67,11 +67,12 @@ void handle_switch_disconnect(struct switch_info *sw) {
     /* remove all links associated with this switch */
     remove_all_switch_links(sw->datapath_id);
     
-    igraph_integer_t vertex_id = find_vertex_by_dpid(sw->datapath_id);
+    igraph_integer_t vertex_id = VECTOR(topology.dpid_to_vertex)[sw->datapath_id];
 
-    if (vertex_id >= 0) {
+    if (vertex_id >= 0) { /* found */
         /* remove the vertex */
         igraph_delete_vertices(&topology.graph, igraph_vss_1(vertex_id));
+        VECTOR(topology.dpid_to_vertex)[sw->datapath_id] = -1; /* mark as not found in case looked up later */
     }
     
     pthread_mutex_unlock(&topology.lock);
@@ -96,15 +97,17 @@ void handle_port_change(struct switch_info *sw, uint16_t src_port_no, bool is_up
 
 /* a function to easily add a vertex to the graph and update the vtex -> dpid vector */
 void add_vertex(uint64_t dpid){
+    
+    pthread_mutex_lock(&topology.lock);
 
     igraph_integer_t vertex_id;
-    
+
     igraph_add_vertices(&topology.graph, 1, NULL); /* add one vertex */
     vertex_id = igraph_vcount(&topology.graph) - 1; /* the newest vertex will be the hightest counted id */
     
     /* set attributes */
     char dpid_str[20];  /* buffer for the string representation */
-    snprintf(dpid_str, sizeof(dpid_str), "%llu", dpid);
+    snprintf(dpid_str, sizeof(dpid_str), "%" PRIu64, dpid);
     igraph_cattribute_VAS_set(&topology.graph, "dpid", vertex_id, dpid_str);
     
     /* map the dpid to the map of dpid to vector id 
@@ -118,39 +121,24 @@ void add_vertex(uint64_t dpid){
 
     /* set the value */
     VECTOR(topology.dpid_to_vertex)[dpid] = vertex_id;
+
+    pthread_mutex_unlock(&topology.lock);
 }
 
-
-/* a function to find a vertex based on its attribute */
-igraph_integer_t find_vertex_by_dpid(uint64_t dpid){
-
-    char dpid_str[20];
-    snprintf(dpid_str, sizeof(dpid_str), "%llu", dpid);
-
-    igraph_integer_t i, total = igraph_vcount(&topology.graph);
-    for(i = 0; i < total; i++){
-
-        /* pull a vetext by its attribute */
-        const char *v_dpid = VAS(&topology.graph, "dpid", i);
-
-        if(strcmp(v_dpid, dpid_str) == 0){
-            return i; /* return i which is the vertex id*/
-        }
-    }
-
-    return -1; /* not found */
-}
 
 /* add or update a link in the topology */
 void add_or_update_link(uint64_t src_dpid, uint16_t src_port, uint64_t dst_dpid, uint16_t dst_port) {
 
     pthread_mutex_lock(&topology.lock);
     /* find or add source and destination vertices */
-    igraph_integer_t src_vertex = find_vertex_by_dpid(src_dpid);
-    igraph_integer_t dst_vertex = find_vertex_by_dpid(dst_dpid);
+     
+    igraph_integer_t src_vertex = VECTOR(topology.dpid_to_vertex)[src_dpid];
+    igraph_integer_t dst_vertex = VECTOR(topology.dpid_to_vertex)[dst_dpid];
 
     if (src_vertex < 0 || dst_vertex < 0) {
-        
+        log_msg("Failed to find vertex in Vector\n");
+        pthread_mutex_unlock(&topology.lock);
+        return;
     }
     
     /* check if edge already exists */
@@ -174,8 +162,11 @@ void add_or_update_link(uint64_t src_dpid, uint16_t src_port, uint64_t dst_dpid,
 /* a function to remove a link from the topology */
 void remove_links_for_port(uint64_t dpid, uint16_t src_port_no){
 
-    igraph_integer_t vertex = find_vertex_by_dpid(dpid);
+    pthread_mutex_lock(&topology.lock);
+
+    igraph_integer_t vertex = VECTOR(topology.dpid_to_vertex)[dpid];
     if (vertex < 0) {
+        log_msg("Failed to find vertex in Vector\n");
         return; /* vertex not found */
     }
 
@@ -189,14 +180,20 @@ void remove_links_for_port(uint64_t dpid, uint16_t src_port_no){
 
         /* if current edge has switch with down port and the port number matches target */
         if ((igraph_integer_t)src == vertex && (uint16_t)src_port == src_port_no) {
-            igraph_delete_edges(&topology.graph, igraph_ess_1(i));
+            igraph_delete_edges(&topology.graph, igraph_ess_1(i));  
         }
     }
+
+    pthread_mutex_unlock(&topology.lock);
 }
 
 /* a function to find all links in the graph with disconnected dpid */
 void remove_all_switch_links(uint64_t dpid){
 
+    pthread_mutex_lock(&topology.lock);
+
+    igraph_integer_t edges_to_remove[igraph_ecount(&topology.graph)];
+    int edges_marked_to_remove = 0;
     igraph_integer_t i, total = igraph_ecount(&topology.graph);
     for(i = 0; i < total; i++){ /* i is edge id */
         igraph_real_t src = EAN(&topology.graph, "src_dpid", i);
@@ -204,9 +201,17 @@ void remove_all_switch_links(uint64_t dpid){
 
         /* any edge that contains the down switch, remove */
         if((uint64_t)src == dpid || (uint64_t)dst == dpid){
-            igraph_delete_edges(&topology.graph, igraph_ess_1(i));
+            edges_to_remove[edges_marked_to_remove++] = i;
+            
         }
     }
+
+    /* in case outer edges are moved down to fill lower ID, remove after processing */
+    for (i = 0; i < edges_marked_to_remove; i++) {
+        igraph_delete_edges(&topology.graph, igraph_ess_1(edges_to_remove[i]));
+    }
+
+    pthread_mutex_unlock(&topology.lock);
 };
 
 void send_lldp_packet(struct switch_info *sw, uint16_t port_no) {
