@@ -62,6 +62,12 @@ struct switch_info {
     struct ofp_phy_port *ports;     /* array of ports */
     int num_ports;             /* number of ports */
     
+    /* port modication tracking */
+    uint16_t * modified_ports;  /* array of modified ports */
+    int num_modified_ports;     /* number of modified ports */
+    int modified_ports_capacity;  /* capacity of modified ports array */
+    pthread_mutex_t modified_ports_lock;  /* lock for modified ports */
+
     /* Statistics/Monitoring */
     uint32_t packet_in_count;  /* number of packet-ins */
     uint32_t port_changes;     /* Number of port changes */
@@ -101,7 +107,7 @@ bool process_switch_messages(struct switch_info *sw);
 void handle_switch_periodic_tasks(struct switch_info *sw);
 void cleanup_switch(struct switch_info *sw);
 void handle_switch_disconnection(struct switch_info *sw);
-
+void mark_port_modified(struct switch_info *sw, uint16_t port_no);
 /* mac table functions */
 struct mac_entry *find_mac(uint8_t *mac);
 void add_mac(uint8_t *mac, uint64_t dpid, uint16_t port);

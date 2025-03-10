@@ -306,14 +306,13 @@ void *accept_handler(void *arg) {
 /* handler for each connected switch, manages the lifecycle of a connection  */
 void *switch_handler(void *arg) {
     struct switch_info *sw = (struct switch_info *)arg;
-    
-    // Initialize the switch
+
     if (!initialize_switch(sw)) {
         cleanup_switch(sw);
         return NULL;
     }
     
-    // Main message handling loop
+    /* main message handling loop */
     while (sw->active && running) {
         if (!process_switch_messages(sw)) {
 
@@ -321,31 +320,33 @@ void *switch_handler(void *arg) {
             break;
         }
         
-        // Handle periodic tasks
         handle_switch_periodic_tasks(sw);
     }
-
-
     
-    // Clean up
     cleanup_switch(sw);
     return NULL;
 }
 
-// Initialize a new switch connection
+/* initialize a new switch connection */
 bool initialize_switch(struct switch_info *sw) {
     sw->hello_received = 0;
     sw->features_received = 0;
     sw->last_echo_xid = 0;
     sw->echo_pending = false;
+
+    /* initialize modified ports */
+    sw->modified_ports = NULL;
+    sw->num_modified_ports = 0;
+    sw->modified_ports_capacity = 0;
+    pthread_mutex_init(&sw->modified_ports_lock, NULL);
     
-    // Start OpenFlow handshake
+    /* start OpenFlow handshake */
     send_hello(sw);
     
     return true;
 }
 
-// Process incoming messages from a switch
+/* process incoming messages from a switch */
 bool process_switch_messages(struct switch_info *sw) {
     struct timeval tv;
     tv.tv_sec = 1;
@@ -359,7 +360,7 @@ bool process_switch_messages(struct switch_info *sw) {
     
     if (ret < 0) {
         if (errno == EINTR) {
-            return true; // Interrupted, but continue
+            return true; /* interrupted, but continue */
         }
         log_msg("Error in select for switch %016" PRIx64 ": %s\n", 
                sw->datapath_id, strerror(errno));
@@ -376,7 +377,7 @@ bool process_switch_messages(struct switch_info *sw) {
             return false;
         } else if (len < 0) {
             if (errno == EINTR) {
-                return true; // Interrupted, but continue
+                return true; /* interrupted, but continue */
             } else if (errno == ECONNRESET) {
                 log_msg("Connection reset by switch %016" PRIx64 "\n", 
                        sw->datapath_id);
@@ -387,18 +388,18 @@ bool process_switch_messages(struct switch_info *sw) {
             return false;
         }
         
-        // Process message
+        
         handle_switch_message(sw, buf, len);
     }
     
     return true;
 }
 
-// Handle periodic tasks for a switch
+/* function to handle periodic tasks for a switch */
 void handle_switch_periodic_tasks(struct switch_info *sw) {
     time_t now = time(NULL);
     
-    // Handle echo requests
+    /* handle echo requests */
     if (sw->features_received) {
         static time_t next_echo = 0;
         
@@ -409,12 +410,12 @@ void handle_switch_periodic_tasks(struct switch_info *sw) {
         if (sw->echo_pending && (now - sw->last_echo) > ECHO_TIMEOUT) {
             sw->echo_pending = false;
             
-            // If no echo response and timeout exceeded, handle disconnection
+            /* handle disconnection if echo timeout */
             if (sw->last_echo_reply < sw->last_echo - ECHO_TIMEOUT) {
                 log_msg("Switch %016" PRIx64 " not responding to echo requests\n", 
                        sw->datapath_id);
                 handle_switch_disconnection(sw);
-                sw->active = 0; // Signal the main loop to exit
+                sw->active = 0; /* signal the main loop to exit */
             }
         }
         
@@ -426,9 +427,9 @@ void handle_switch_periodic_tasks(struct switch_info *sw) {
     }
 }
 
-// Function to handle switch disconnection
+/* function to handle switch disconnection */
 void handle_switch_disconnection(struct switch_info *sw) {
-    // Log the disconnection
+    
     log_msg("Switch %016" PRIx64 " disconnected, cleaning up resources\n", sw->datapath_id);
     
     
@@ -441,17 +442,17 @@ void handle_switch_disconnection(struct switch_info *sw) {
     struct topology_node *node = global_topology.nodes;
     struct topology_node *prev = NULL;
     
-    // Find and remove the node for this switch
+    /* find and remove the node for this switch */
     while (node != NULL) {
         if (node->dpid == sw->datapath_id) {
-            // Remove all links
+            /* remove all links */
             while (node->links != NULL) {
                 struct topology_link *link = node->links;
                 node->links = link->next;
                 free(link);
             }
             
-            // Remove node from list
+            /* remove node from list */
             if (prev == NULL) {
                 global_topology.nodes = node->next;
             } else {
@@ -474,7 +475,7 @@ void handle_switch_disconnection(struct switch_info *sw) {
         
         while (link != NULL) {
             if (link->linked_dpid == sw->datapath_id) {
-                // Remove this link
+                /* remove this link */
                 if (prev_link == NULL) {
                     node->links = link->next;
                 } else {
@@ -511,7 +512,41 @@ void handle_switch_disconnection(struct switch_info *sw) {
     sw->ports = NULL;
     sw->num_ports = 0;
     
-    // 5. Notify the controller about topology change
+    /* notify the controller about topology change */
     log_msg("Topology updated after switch %016" PRIx64 " disconnection\n", 
             sw->datapath_id);
+}
+
+/* function to mark a port (number) as needing to be explored due to modification */
+void mark_port_modified(struct switch_info *sw, uint16_t port_no) {
+    pthread_mutex_lock(&sw->modified_ports_lock);
+    
+    /* check if port is already in the list */
+    int i;
+    for (i = 0; i < sw->num_modified_ports; i++) {
+        if (sw->modified_ports[i] == port_no) {
+            pthread_mutex_unlock(&sw->modified_ports_lock);
+            return;  // Port already marked, nothing to do
+        }
+    }
+    
+    /* need to add the port - check if we need to expand the array */
+    if (sw->num_modified_ports >= sw->modified_ports_capacity) {
+        int new_capacity = (sw->modified_ports_capacity == 0) ? 8 : sw->modified_ports_capacity * 2;
+        uint16_t *new_array = realloc(sw->modified_ports, new_capacity * sizeof(uint16_t));
+        
+        if (!new_array) {
+            log_msg("Failed to allocate memory for modified ports list\n");
+            pthread_mutex_unlock(&sw->modified_ports_lock);
+            return;
+        }
+        
+        sw->modified_ports = new_array;
+        sw->modified_ports_capacity = new_capacity;
+    }
+    
+    /* add the port to the list */
+    sw->modified_ports[sw->num_modified_ports++] = port_no;
+    
+    pthread_mutex_unlock(&sw->modified_ports_lock);
 }

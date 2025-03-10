@@ -197,7 +197,7 @@ void handle_port_status(struct switch_info *sw, struct ofp_port_status *ps) {
         case OFPPR_ADD:
             reason_str = "PORT ADDED";
             /* DISCOVER NEW DEVICE ON THAT PORT HERE */
-            send_lldp_packet(sw, ntohs(port->port_no));
+            mark_port_modified(sw, ntohs(port->port_no));
             break;
         case OFPPR_DELETE:
             reason_str = "PORT REMOVED";
@@ -206,16 +206,7 @@ void handle_port_status(struct switch_info *sw, struct ofp_port_status *ps) {
             break;
         case OFPPR_MODIFY:
             reason_str = "PORT MODIFIED";
-            if (!(ntohl(port->state) & OFPPS_LINK_DOWN)) { /* port is down */
-                /* UPDATE THE LINK STATUS */
-                topology_remove_link(sw->datapath_id, ntohs(port->port_no));
-            } else { /* port is up */
-                /* UPDATE THE LINK STATUS */
-                topology_remove_link(sw->datapath_id, ntohs(port->port_no));
-                send_lldp_packet(sw, ntohs(port->port_no));
-
-
-            }
+            mark_port_modified(sw, ntohs(port->port_no));
             break;
         default:
             reason_str = "UNKNOWN";
@@ -265,30 +256,32 @@ void handle_packet_in(struct switch_info *sw, struct ofp_packet_in *pi) {
     Action will indeed be to output to MULTIPLE ports (all ports in the MST except the input port)
     For this, you'll need to construct a flow rule with multiple actions
     */
+
+
     if (!pi) {
         log_msg("Error: Null packet_in message\n");
         return;
     }
 
-    /* First check for an LLDP packet - for topology discovery */
+    /* check for lldp packet */
     if (is_lldp_packet(pi->data)) {
         handle_lldp_packet(sw, pi);
         return;  /* No further processing for LLDP packets */
     }
 
-    /* Extract ethernet frame information */
+    /* extract ethernet frame information */
     uint8_t *eth_frame_start = pi->data;
     uint8_t *eth_dst = eth_frame_start;
     uint8_t *eth_src = eth_frame_start + ETHERNET_ADDR_LEN;
 
-    /* Add source MAC to global MAC table */
+    /* add source MAC to global MAC table */
     add_mac(eth_src, sw->datapath_id, ntohs(pi->in_port));
     
-    /* Extract packet information */
+    /* extract packet information */
     uint16_t total_len = ntohs(pi->total_len);
     uint16_t in_port = ntohs(pi->in_port);
     
-    /* Increment packet counter */
+    /* increment packet counter */
     pthread_mutex_lock(&sw->lock);
     sw->packet_in_count++;
     pthread_mutex_unlock(&sw->lock);
@@ -296,37 +289,39 @@ void handle_packet_in(struct switch_info *sw, struct ofp_packet_in *pi) {
     log_msg("PACKET_IN from switch %016" PRIx64 ", port %u, size %u bytes\n", 
             sw->datapath_id, in_port, total_len);
     
-    /* Check if it's a broadcast/multicast packet */
+    /* check if it's a broadcast/multicast packet */
     if (eth_dst[0] & 0x01) {  /* LSB of first octet = 1 for multicast/broadcast */
         log_msg("Handling broadcast/multicast packet\n");
         
-        /* Calculate MST with current switch as root */
+        /* calculate MST with current switch as root */
         struct mst *tree = calculate_mst(sw->datapath_id);
         if (tree) {
-            /* Install broadcast flow rules */
+            /* install broadcast flow rules */
             install_broadcast_flows(tree, eth_dst);
             
-            /* Send packet_out to broadcast the current packet */
-            /* Find all output ports from MST */
+            /* send packet_out to broadcast the current packet */
+            /* find all output ports from MST */
             uint16_t out_ports[MAX_SWITCH_PORTS];
             int num_ports = 0;
             
-            /* Find this switch in the MST */
-            for (int i = 0; i < tree->num_nodes; i++) {
+            /* find this switch in the MST */
+            int i;
+            for (i = 0; i < tree->num_nodes; i++) {
+                
                 if (tree->nodes[i].dpid == sw->datapath_id) {
-                    /* Add all child ports */
+                    /* add all child ports */
                     for (int j = 0; j < tree->nodes[i].num_children; j++) {
                         if (tree->nodes[i].child_ports && 
                             tree->nodes[i].child_ports[j] != 0 &&
-                            tree->nodes[i].child_ports[j] != in_port) { /* Don't send back on input port */
+                            tree->nodes[i].child_ports[j] != in_port) { /* don't send back on input port */
                             out_ports[num_ports++] = tree->nodes[i].child_ports[j];
                         }
                     }
                     
-                    /* Add parent port if not the root */
+                    /* add parent port if not the root */
                     if (tree->nodes[i].dpid != tree->root_dpid && 
                         tree->nodes[i].parent_port != 0 &&
-                        tree->nodes[i].parent_port != in_port) { /* Don't send back on input port */
+                        tree->nodes[i].parent_port != in_port) { /* don't send back on input port */
                         out_ports[num_ports++] = tree->nodes[i].parent_port;
                     }
                     break;
@@ -334,13 +329,13 @@ void handle_packet_in(struct switch_info *sw, struct ofp_packet_in *pi) {
             }
             
             /* Forward the packet out all ports */
-            for (int i = 0; i < num_ports; i++) {
+            for (i = 0; i < num_ports; i++) {
                 send_packet_out(sw, pi->data, total_len, out_ports[i]);
                 log_msg("Forwarding broadcast packet out port %u\n", out_ports[i]);
             }
             
             /* Free MST resources */
-            for (int i = 0; i < tree->num_nodes; i++) {
+            for (i = 0; i < tree->num_nodes; i++) {
                 if (tree->nodes[i].child_ports) {
                     free(tree->nodes[i].child_ports);
                 }
@@ -373,10 +368,10 @@ void handle_packet_in(struct switch_info *sw, struct ofp_packet_in *pi) {
                 /* Calculate shortest path to the destination switch */
                 struct path *path = calculate_shortest_path(sw->datapath_id, dst_entry->switch_dpid);
                 if (path) {
-                    /* Install flows along the path */
+                    /* install flows along the path */
                     install_unicast_flows(path, eth_dst);
                     
-                    /* Forward the current packet out the first hop */
+                    /* forward the current packet out the first hop */
                     struct path_node *first_node = path->nodes;
                     if (first_node && first_node->out_port != 0) {
                         send_packet_out(sw, pi->data, total_len, first_node->out_port);
@@ -384,7 +379,7 @@ void handle_packet_in(struct switch_info *sw, struct ofp_packet_in *pi) {
                                 first_node->out_port);
                     }
                     
-                    /* Free path resources */
+                    /* free path resources */
                     struct path_node *node = path->nodes;
                     while (node) {
                         struct path_node *next = node->next;
@@ -397,11 +392,12 @@ void handle_packet_in(struct switch_info *sw, struct ofp_packet_in *pi) {
                 }
             }
         } else {
-            /* Unknown destination MAC - flood the packet */
+            /* unknown destination MAC - flood the packet */
             log_msg("Unknown destination MAC, flooding\n");
             
-            /* Similar to broadcast, but we'll just flood to all ports */
-            for (int i = 0; i < sw->num_ports; i++) {
+            /* similar to broadcast, but we'll just flood to all ports */
+            int i;
+            for (i = 0; i < sw->num_ports; i++) {
                 uint16_t port_no = ntohs(sw->ports[i].port_no);
                 
                 /* Skip non-physical ports and input port */
