@@ -49,8 +49,8 @@
 * 8. The send_echo_request function sends an ECHO_REQUEST to the switch.
 *  - The function creates an ECHO_REQUEST message and sends it to the switch.
 */
-#include "smartalloc.h"
-#include "checksum.h"
+#include "headers/smartalloc.h"
+#include "headers/checksum.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -75,11 +75,37 @@
     #define be64toh(x) OSSwapBigToHostInt64(x)
 #endif
 
-#include "controller.h"
-#include "openflow.h"
+#include "headers/controller.h"
+#include "headers/openflow.h"
 
 #define DEF_PORT 6653
 
+/* -------------------------------------------------- MAC TABLE ---------------------------------------------------- */
+
+struct mac_entry *mac_table = NULL;
+
+/* add or update an entry */
+void add_mac(uint8_t *mac, uint64_t dpid) {
+    struct mac_entry *entry;
+    
+    HASH_FIND(hh, mac_table, mac, MAC_ADDR_LEN, entry);
+    if (entry == NULL) {
+        entry = malloc(sizeof(struct mac_entry));
+        memcpy(entry->mac, mac, MAC_ADDR_LEN);
+        HASH_ADD(hh, mac_table, mac, MAC_ADDR_LEN, entry);
+    }
+    
+    /* add other values of update values if already exists */
+    entry->switch_dpid = dpid;
+    entry->last_seen = time(NULL);
+}
+
+/* find an entry */
+struct mac_entry *find_mac(uint8_t *mac) {
+    struct mac_entry *entry;
+    HASH_FIND(hh, mac_table, mac, MAC_ADDR_LEN, entry);
+    return entry;
+}
 
 /* signal handler */
 void signal_handler(int signum) {
@@ -118,7 +144,9 @@ void cleanup_switch(struct switch_info *sw) {
     if (sw->active) {
         sw->active = 0;
         close(sw->socket);
-        free(sw->ports);
+        if (sw->ports != NULL) {
+            free(sw->ports);
+        }
         sw->ports = NULL;
         sw->num_ports = 0;
         sw->hello_received = 0;
@@ -170,6 +198,10 @@ int main(int argc, char *argv[]) {
     
     /* destroy global mutex */
     pthread_mutex_destroy(&switches_lock);
+    for (struct mac_entry *entry = mac_table; entry != NULL; entry = entry->hh.next) {
+        HASH_DEL(mac_table, entry);
+        free(entry);
+    }
     return 0;
 }
 
@@ -217,7 +249,7 @@ void init_controller(int port) {
     
     /* listen for connections */
     if (listen(server_socket, 5) < 0) {
-        perror("Failed to listen");
+        perror("Failed to listen for connections on main socket \n");
         exit(1);
     }
     
@@ -229,6 +261,14 @@ void init_controller(int port) {
         perror("Failed to create accept thread");
         exit(1);
     }
+
+    /*
+    pthread_t topology_thread;
+    if (pthread_create(&topology_thread, NULL, topology_handler, NULL) != 0) {
+        perror("Failed to create topology thread");
+        exit(1);
+    }
+    */
 }
 
 /* -------------------------------------------------- Initialize Threads ------------------------------------------------------- */
@@ -267,12 +307,11 @@ void *accept_handler(void *arg) {
                 
                 /* create handler thread */
                 if (pthread_create(&switches[i].thread, NULL, switch_handler, &switches[i]) != 0) {
-                    perror("Failed to create switch handler thread");
                     close(client);
                     switches[i].active = 0;
-                    printf("Failed to create handler thread for switch %d\n", i);
+                    fprintf(stderr, "Failed to create handler thread for switch %d\n", i);
                 } else {
-                    printf("Successfully created handler thread for switch %d\n", i);
+                    fprintf(stdout, "Successfully created handler thread for switch %d\n", i);
                 }
                 break;
             }
@@ -299,15 +338,137 @@ void *switch_handler(void *arg) {
     printf("Switch handler started for new connection\n");
     
     /* initialize switch state */
-    sw->hello_received = 0;
-    sw->features_received = 0;
-    sw->last_echo_xid = 0;
+    sw->hello_received = false;
+    sw->features_received = false;
     sw->echo_pending = false;
+    sw->last_echo = 0;
+    sw->last_echo_reply = 0; 
+    sw->last_echo_xid = 0; 
+
+    /* read socket setup */
+    struct timeval tv;
+        tv.tv_sec = 1; 
+        tv.tv_usec = 0;
+        
+    fd_set readfds;
+    FD_ZERO(&readfds);
+    FD_SET(sw->socket, &readfds);
     
-    /* start OpenFlow handshake */
-    send_hello(sw);
+    /* start OpenFlow handshake with hello message */
     
-    /* message handling loop */
+    /* ------------------------------------- SWITCH HELLO -------------------------------------- */
+    if ((send_hello(sw)) == -1){
+        cleanup_switch(sw);
+        return NULL;
+    };
+    time_t hello_sent = time(NULL);
+
+    /* wait for hello response or timeout */
+    while (!sw->hello_received && (time(NULL) - hello_sent) < HELLO_TIMEOUT) {
+
+        /* read from the socket */
+        int ret = select(sw->socket + 1, &readfds, NULL, NULL, &tv);
+
+        /* a file descriptor is ready for reading */
+        if (ret > 0 && FD_ISSET(sw->socket, &readfds)) { 
+            len = recv(sw->socket, buf, sizeof(buf), 0);
+
+            /* if 0, then client disconnected gracefully */
+            if (len == 0) {
+                log_msg("Connection closed cleanly by switch %016" PRIx64 "\n", 
+                       sw->datapath_id);
+                cleanup_switch(sw);
+                break;
+
+            /* if less than 0, client disconnected with errors */
+            } else if (len < 0) {
+                if (errno == EINTR) {
+                    continue;
+                } else if (errno == ECONNRESET) {
+                    log_msg("Connection reset by switch %016" PRIx64 "\n", 
+                           sw->datapath_id);
+                } else {
+                    log_msg("Receive error on switch %016" PRIx64 ": %s\n",
+                           sw->datapath_id, strerror(errno));
+                }
+                break;
+            }
+            
+            /* message recieved successfully, process message to ensure first is a hello */
+            struct ofp_header *oh = (struct ofp_header *)buf;
+            if (oh->type == OFPT_HELLO) {
+                if ((handle_hello(sw, oh)) == -1) {
+                    cleanup_switch(sw);
+                    return NULL;
+                }
+                
+            } else {
+                log_msg("Unexpected message type: %d expected HELLO\n", oh->type);
+                cleanup_switch(sw);
+                return NULL;
+            }
+        }
+    }
+
+    /* hello round trip successful, send features */
+
+    /* ----------------------------------- SWITCH FEATURES ------------------------------------- */
+    if ((send_features_request(sw)) == -1){
+        cleanup_switch(sw);
+        return NULL;
+    };
+    time_t features_sent = time(NULL);
+
+    /* wait for feature response or timeout */
+    while (!sw->features_received && (time(NULL) - features_sent) < FEATURES_TIMEOUT) {
+
+        /* read from the socket */
+        int ret = select(sw->socket + 1, &readfds, NULL, NULL, &tv);
+
+        /* a file descriptor is ready for reading */
+        if (ret > 0 && FD_ISSET(sw->socket, &readfds)) { 
+            len = recv(sw->socket, buf, sizeof(buf), 0);
+
+            /* if 0, then client disconnected gracefully */
+            if (len == 0) {
+                log_msg("Connection closed cleanly by switch %016" PRIx64 "\n", 
+                       sw->datapath_id);
+                cleanup_switch(sw);
+                break;
+
+            /* if less than 0, client disconnected with errors */
+            } else if (len < 0) {
+                if (errno == EINTR) {
+                    continue;
+                } else if (errno == ECONNRESET) {
+                    log_msg("Connection reset by switch %016" PRIx64 "\n", 
+                           sw->datapath_id);
+                } else {
+                    log_msg("Receive error on switch %016" PRIx64 ": %s\n",
+                           sw->datapath_id, strerror(errno));
+                }
+                break;
+            }
+            
+            /* message recieved successfully, process message to ensure first is a feature reply */
+            struct ofp_header *oh = (struct ofp_header *)buf;
+            if (oh->type == OFPT_FEATURES_REPLY) {
+                handle_features_reply(sw, (struct ofp_switch_features *)oh);
+            } else {
+                log_msg("Unexpected message type: %d, expected FEATRUES REPLY\n", oh->type);
+                cleanup_switch(sw);
+                return NULL;
+            }
+        }
+    }
+
+    /* features round trip successful, maintain connection and listen for new messages */
+    
+    /* ----------------------------------- SWITCH MESSAGING ------------------------------------ */
+    sw->last_echo = time(NULL);
+    sw->last_echo_reply = time(NULL); 
+    next_echo = time(NULL) + ECHO_INTERVAL;
+
     while (sw->active && running) {
         struct timeval tv;
         tv.tv_sec = 1; 
@@ -322,25 +483,31 @@ void *switch_handler(void *arg) {
         now = time(NULL);
         
         /* handle echo timing independent of message receipt */
-        if (sw->features_received) {
-            if (next_echo == 0) {
+        if (next_echo == 0) {
                 next_echo = now + ECHO_INTERVAL;
             }
             
+            /* echo response never recieved, disconnect switch */
             if (sw->echo_pending && (now - sw->last_echo) > ECHO_TIMEOUT) {
+                log_msg("Echo timeout detected for switch %016" PRIx64 ". Last echo: %ld, current time: %ld\n", 
+                                                sw->datapath_id, sw->last_echo, now);
                 sw->echo_pending = false;
+                cleanup_switch(sw);
+                return NULL;
             }
             
             if (!sw->echo_pending && now >= next_echo) {
                 if (send_echo_request(sw)) {
                     next_echo = now + ECHO_INTERVAL;
+                } else {
+                    continue;
                 }
-            }
         }
         
         /* handle incoming messages if any */
         if (ret > 0 && FD_ISSET(sw->socket, &readfds)) {
             len = recv(sw->socket, buf, sizeof(buf), 0);
+
             if (len == 0) {
                 log_msg("Connection closed cleanly by switch %016" PRIx64 "\n", 
                        sw->datapath_id);
@@ -378,59 +545,53 @@ void *switch_handler(void *arg) {
     return NULL;
 }
 
-/* ----------------------------------------------- Handle Openflow Messages ---------------------------------------------------- */
 
-/* handle incoming OpenFlow message, see while loop in switch handler */
-void handle_switch_message(struct switch_info *sw, uint8_t *msg, size_t len) {
-    struct ofp_header *oh = (struct ofp_header *)msg;
-    
-    /* verify message length */
-    if (len < sizeof(*oh)) {
-        log_msg("Message too short\n");
-        return;
+/* default function for sending OpenFlow message */
+int send_openflow_msg(struct switch_info *sw, void *msg, size_t len, char * type) {
+
+    pthread_mutex_lock(&sw->lock); /* lock threads for safety */
+    if (sw->active) {
+        if (send(sw->socket, msg, len, 0) < 0) { /* send to socket at switch */
+            fprintf(stderr, "Failed to send message %s to switch %016" PRIx64 "\n", type, sw->datapath_id);
+            pthread_mutex_unlock(&sw->lock);
+            return -1;
+        }
     }
+    pthread_mutex_unlock(&sw->lock);
+    return 0;
+}
+
+/* --------------------------------------------------- HELLO ------------------------------------------------------- */
+
+/* send HELLO message */
+int send_hello(struct switch_info *sw) {
+    struct ofp_header hello;
     
-    /* Hhndle based on message type */
-    switch (oh->type) {
-        case OFPT_HELLO:
-            handle_hello(sw, oh);
-            break;
-            
-        case OFPT_ECHO_REQUEST:
-            handle_echo_request(sw, oh);
-            break;
-            
-        case OFPT_ECHO_REPLY:
-            handle_echo_reply(sw, oh);
-            break;
-            
-        case OFPT_FEATURES_REPLY:
-            handle_features_reply(sw, (struct ofp_switch_features *)msg);
-            sw->features_received = 1;
-            break;
-            
-        case OFPT_PACKET_IN:
-            handle_packet_in(sw, (struct ofp_packet_in *)msg);
-            break;
-            
-        case OFPT_PORT_STATUS:
-            handle_port_status(sw, (struct ofp_port_status *)msg);
-            break;
-            
-        default:
-            log_msg("Unhandled message type: %d\n", oh->type);
+    hello.version = OFP_VERSION;
+    hello.type = OFPT_HELLO;
+    hello.length = htons(sizeof(hello));
+    hello.xid = htonl(0);
+    
+    /* use OpenFlow hello packet */
+    if ((send_openflow_msg(sw, &hello, sizeof(hello), "HELLO")) == -1){
+        return -1;
     }
+
+    /* success */
+    fprintf(stdout, "Hello message sent to switch %016" PRIx64 "\n", sw->datapath_id);
+    return 0;
 }
 
 /* handle HELLO message */
-void handle_hello(struct switch_info *sw, struct ofp_header *oh) {
+int handle_hello(struct switch_info *sw, struct ofp_header *oh) {
+
     sw->version = oh->version;
     sw->hello_received = 1;  /* mark HELLO as received */
     log_msg("Switch hello received, version 0x%02x\n", sw->version);
     
     /* only send features request after HELLO exchange is complete */
     if (sw->version == OFP_VERSION) {
-        send_features_request(sw);
+        return 0; /* send feature request next */
     } else {
         /* version mismatch - should send error */
         struct ofp_error_msg error;
@@ -440,27 +601,49 @@ void handle_hello(struct switch_info *sw, struct ofp_header *oh) {
         error.header.xid = oh->xid;
         error.type = htons(OFPET_HELLO_FAILED);
         error.code = htons(OFPHFC_INCOMPATIBLE);
-        send_openflow_msg(sw, &error, sizeof(error));
+        send_openflow_msg(sw, &error, sizeof(error), "ERROR");
         sw->active = 0;  /* mark for disconnection */
+        return -1;
     }
 }
 
-/* handle echo requests/replies */
-void handle_echo_request(struct switch_info *sw, struct ofp_header *oh) {
-    struct ofp_header echo;
+/* -------------------------------------------------- FEATURES ----------------------------------------------------- */
+
+/* send features request */
+int send_features_request(struct switch_info *sw) {
+    struct ofp_header freq;
     
-    /* simply change the type to reply and send it back */
-    memcpy(&echo, oh, sizeof(echo));
-    echo.type = OFPT_ECHO_REPLY;
+    freq.version = OFP_VERSION;
+    freq.type = OFPT_FEATURES_REQUEST;
+    freq.length = htons(sizeof(freq));
+    freq.xid = htonl(1);
     
-    send_openflow_msg(sw, &echo, sizeof(echo));
+    if ((send_openflow_msg(sw, &freq, sizeof(freq), "FEATURES")) == -1){
+        return -1;
+    }
+
+    /* success */
+    fprintf(stdout, "Features request sent to switch %016" PRIx64 "\n", sw->datapath_id);
+    return 0;
 }
 
 /* handle features reply */
 void handle_features_reply(struct switch_info *sw, struct ofp_switch_features *features) {
+
+    /* mark features as seen in switch */
+    sw->features_received = 1;
+
     sw->datapath_id = be64toh(features->datapath_id);
     sw->n_tables = features->n_tables;
-    
+
+    /* extract MAC address*/
+    uint8_t mac_address[MAC_ADDR_LEN];
+    uint8_t *src = (uint8_t *)&sw->datapath_id;
+    memcpy(mac_address, src, MAC_ADDR_LEN);
+
+    /* add switch to mac table */
+    add_mac(mac_address, sw->datapath_id);
+
     /* calculate number of ports */
     size_t port_list_len = ntohs(features->header.length) - sizeof(*features);
     int num_ports = port_list_len / sizeof(struct ofp_phy_port);
@@ -480,6 +663,8 @@ void handle_features_reply(struct switch_info *sw, struct ofp_switch_features *f
     log_msg("  Number of ports: %d\n", num_ports);
     
     /* print capabilities for debugging purposes */
+
+    #ifdef DEBUG
     log_msg("  Capabilities:\n");
     uint32_t capabilities = ntohl(features->capabilities);
     if (capabilities & OFPC_FLOW_STATS)    log_msg("    - Flow statistics\n");
@@ -489,10 +674,15 @@ void handle_features_reply(struct switch_info *sw, struct ofp_switch_features *f
     if (capabilities & OFPC_IP_REASM)      log_msg("    - IP reasm\n");
     if (capabilities & OFPC_QUEUE_STATS)   log_msg("    - Queue statistics\n");
     if (capabilities & OFPC_ARP_MATCH_IP)  log_msg("    - ARP match IP\n");
+
+    #endif
     
-    /* Print ports for debugging purposes */
-    for (int i = 0; i < num_ports; i++) {
+    /* print ports for debugging purposes */
+    int i;
+    for (i = 0; i < num_ports; i++) {
         struct ofp_phy_port *port = &sw->ports[i];
+
+        /* print physical port address */
         log_msg("\nPort %d:\n", ntohs(port->port_no));
         log_msg("  Name: %s\n", port->name);
         log_msg("  HW Addr: %02x:%02x:%02x:%02x:%02x:%02x\n",
@@ -506,6 +696,7 @@ void handle_features_reply(struct switch_info *sw, struct ofp_switch_features *f
             log_msg("  State: Link up\n");
             
         /* print port features */
+        /*
         uint32_t curr = ntohl(port->curr);
         log_msg("  Current features:\n");
         if (curr & OFPPF_10MB_HD)    log_msg("    - 10Mb half-duplex\n");
@@ -520,49 +711,84 @@ void handle_features_reply(struct switch_info *sw, struct ofp_switch_features *f
         if (curr & OFPPF_AUTONEG)    log_msg("    - Auto-negotiation\n");
         if (curr & OFPPF_PAUSE)      log_msg("    - Pause\n");
         if (curr & OFPPF_PAUSE_ASYM) log_msg("    - Asymmetric pause\n");
+
+        */
     }
 }
 
-/* handle incoming packets from the switch */
-void handle_packet_in(struct switch_info *sw, struct ofp_packet_in *pi) {
-    if (!pi) {
-        log_msg("Error: Null packet_in message\n");
+/* ------------------------------------------------- MESSAGING ----------------------------------------------------- */
+
+/* handle incoming OpenFlow message, see while loop in switch handler */
+void handle_switch_message(struct switch_info *sw, uint8_t *msg, size_t len) {
+    struct ofp_header *oh = (struct ofp_header *)msg;
+    
+    /* verify message length */
+    if (len < sizeof(*oh)) {
+        log_msg("Message too short\n");
         return;
     }
-
-    /* lock switch for thread safety while accessing switch info */
-    pthread_mutex_lock(&sw->lock);
     
-    /* increment packet counter */
-    sw->packet_in_count++;
-    
-    /* extract basic packet information */
-    uint32_t buffer_id = ntohl(pi->buffer_id);
-    uint16_t total_len = ntohs(pi->total_len);
-    uint16_t in_port = ntohs(pi->in_port);
-    
-    /* get reason for packet in */
-    const char *reason_str = "Unknown";
-    switch (pi->reason) {
-        case OFPR_NO_MATCH:
-            reason_str = "No matching flow";
+    /* Handle based on message type */
+    switch (oh->type) {
+            
+        case OFPT_ECHO_REQUEST:
+            handle_echo_request(sw, oh);
             break;
-        case OFPR_ACTION:
-            reason_str = "Action explicitly output to controller";
+            
+        case OFPT_ECHO_REPLY:
+            handle_echo_reply(sw, oh);
             break;
+            
+        case OFPT_PACKET_IN:
+            handle_packet_in(sw, (struct ofp_packet_in *)msg);
+            break;
+            
+        case OFPT_PORT_STATUS:
+            handle_port_status(sw, (struct ofp_port_status *)msg);
+            break;
+            
         default:
-            reason_str = "Unknown reason";
+            log_msg("Unhandled message type: %d\n", oh->type);
     }
-    
-    /* log packet information */
-    log_msg("\nPACKET_IN from switch %016" PRIx64 ":\n", sw->datapath_id);
-    log_msg("  Buffer ID: %u\n", buffer_id);
-    log_msg("  Total Length: %u bytes\n", total_len);
-    log_msg("  In Port: %u\n", in_port);
-    log_msg("  Reason: %s\n", reason_str);
+}
 
-    
-    pthread_mutex_unlock(&sw->lock);
+/* -------------------------------------------------- ECHOES ------------------------------------------------------- */
+
+/* send echo request */
+int send_echo_request(struct switch_info *sw) {
+
+    if (!sw->echo_pending) { /* switch is not awaiting an echo */
+        struct ofp_header echo;
+        
+        echo.version = OFP_VERSION;
+        echo.type = OFPT_ECHO_REQUEST;
+        echo.length = htons(sizeof(echo));
+        echo.xid = htonl(sw->last_echo_xid++);
+        
+        /* denote that this switch will now be waitng for an echoe reponse */
+        sw->echo_pending = true;
+        
+        pthread_mutex_lock(&sw->lock);
+        int success = 0;
+        sw->last_echo = time(NULL);
+        if (sw->active) {
+            success = (send(sw->socket, &echo, sizeof(echo), 0) >= 0);
+            if (!success) {
+                sw->echo_pending = false;  /* reset if send failed */
+                pthread_mutex_unlock(&sw->lock);
+                log_msg("Failed to send echo request to switch %016" PRIx64 "\n", sw->datapath_id);
+                return -1;
+            }
+
+            log_msg("Echo request sent to switch %016" PRIx64 " (XID: %u)\n", 
+                    sw->datapath_id, ntohl(echo.xid));
+        }
+        pthread_mutex_unlock(&sw->lock);
+        
+        return 0;
+    }
+    log_msg("Echo request already pending for switch %016" PRIx64 "\n", sw->datapath_id);
+    return false;
 }
 
 /* handle echo reply messages */
@@ -571,7 +797,7 @@ void handle_echo_reply(struct switch_info *sw, struct ofp_header *oh) {
     
     /* update both last reply and last echo time */
     sw->last_echo_reply = time(NULL);
-    sw->echo_pending = false;  /* Mark that anothe echo can be send, meaning echos have vbeen recienved */
+    sw->echo_pending = false;  /* mark that another echo can be send, meaning echos have been recieved */
 
     /* for debugging */
     log_msg("Echo reply received from switch %016" PRIx64 " (XID: %u)\n", 
@@ -580,7 +806,20 @@ void handle_echo_reply(struct switch_info *sw, struct ofp_header *oh) {
     pthread_mutex_unlock(&sw->lock);
 }
 
-/* handle port status changes */
+/* handle echo requests */
+void handle_echo_request(struct switch_info *sw, struct ofp_header *oh) {
+    struct ofp_header echo;
+    
+    /* simply change the type to reply and send it back */
+    memcpy(&echo, oh, sizeof(echo));
+    echo.type = OFPT_ECHO_REPLY;
+    
+    send_openflow_msg(sw, &echo, sizeof(echo), "ECHO REPLY");
+}
+
+/* -------------------------------------------------- PACKET IN ---------------------------------------------------- */
+
+/* handle port status message */
 void handle_port_status(struct switch_info *sw, struct ofp_port_status *ps) {
     if (!ps) {
         log_msg("Error: Null port_status message\n");
@@ -589,8 +828,6 @@ void handle_port_status(struct switch_info *sw, struct ofp_port_status *ps) {
 
     pthread_mutex_lock(&sw->lock);
     
-    /* increment port change counter */
-    sw->port_changes++;
     
     /* get the port description */
     struct ofp_phy_port *port = &ps->desc;
@@ -652,79 +889,41 @@ void handle_port_status(struct switch_info *sw, struct ofp_port_status *ps) {
     pthread_mutex_unlock(&sw->lock);
 }
 
-/* ------------------------------------------------ Send Openflow Messages ----------------------------------------------------- */
-
-/* default function for sending OpenFlow message */
-void send_openflow_msg(struct switch_info *sw, void *msg, size_t len) {
-
-    pthread_mutex_lock(&sw->lock);      /* lock threads for safety */
-    if (sw->active) {
-        if (send(sw->socket, msg, len, 0) < 0) {      /* send to socket at switch */
-            perror("Failed to send message");
-        }
+/* handle incoming packets from the switch */
+void handle_packet_in(struct switch_info *sw, struct ofp_packet_in *pi) {
+    if (!pi) {
+        log_msg("Error: Null packet_in message\n");
+        return;
     }
+
+    /* lock switch for thread safety while accessing switch info */
+    pthread_mutex_lock(&sw->lock);
+    
+    /* extract basic packet information */
+    uint32_t buffer_id = ntohl(pi->buffer_id);
+    uint16_t total_len = ntohs(pi->total_len);
+    uint16_t in_port = ntohs(pi->in_port);
+    
+    /* get reason for packet in */
+    const char *reason_str = "Unknown";
+    switch (pi->reason) {
+        case OFPR_NO_MATCH:
+            reason_str = "No matching flow";
+            break;
+        case OFPR_ACTION:
+            reason_str = "Action explicitly output to controller";
+            break;
+        default:
+            reason_str = "Unknown reason";
+    }
+    
+    /* log packet information */
+    log_msg("\nPACKET_IN from switch %016" PRIx64 ":\n", sw->datapath_id);
+    log_msg("  Buffer ID: %u\n", buffer_id);
+    log_msg("  Total Length: %u bytes\n", total_len);
+    log_msg("  In Port: %u\n", in_port);
+    log_msg("  Reason: %s\n", reason_str);
+
+    
     pthread_mutex_unlock(&sw->lock);
 }
-
-/* send HELLO message */
-void send_hello(struct switch_info *sw) {
-    struct ofp_header hello;
-    
-    hello.version = OFP_VERSION;
-    hello.type = OFPT_HELLO;
-    hello.length = htons(sizeof(hello));
-    hello.xid = htonl(0);
-    
-    /* use OpenFlow hello packet */
-    send_openflow_msg(sw, &hello, sizeof(hello));
-}
-
-/* add echo request/reply support */
-bool send_echo_request(struct switch_info *sw) {
-
-    if (!sw->echo_pending) {
-        struct ofp_header echo;
-        
-        echo.version = OFP_VERSION;
-        echo.type = OFPT_ECHO_REQUEST;
-        echo.length = htons(sizeof(echo));
-        echo.xid = htonl(sw->last_echo_xid++);
-        
-        sw->echo_pending = true;
-        
-        pthread_mutex_lock(&sw->lock);
-        bool success = false;
-        sw->last_echo = time(NULL);
-        if (sw->active) {
-            success = (send(sw->socket, &echo, sizeof(echo), 0) >= 0);
-            if (!success) {
-                sw->echo_pending = false;  /* reset if send failed */
-            }
-
-            log_msg("Echo request sent to switch %016" PRIx64 " (XID: %u)\n", 
-                    sw->datapath_id, ntohl(echo.xid));
-        }
-        pthread_mutex_unlock(&sw->lock);
-        
-        return success;
-    }
-    log_msg("Echo request already pending for switch %016" PRIx64 "\n", sw->datapath_id);
-    return false;
-}
-
-/* send features request */
-void send_features_request(struct switch_info *sw) {
-    struct ofp_header freq;
-    
-    freq.version = OFP_VERSION;
-    freq.type = OFPT_FEATURES_REQUEST;
-    freq.length = htons(sizeof(freq));
-    freq.xid = htonl(1);
-    
-    send_openflow_msg(sw, &freq, sizeof(freq));
-}
-
-
-
-
-
