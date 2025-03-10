@@ -390,7 +390,7 @@ void handle_switch_message(struct switch_info *sw, uint8_t *msg, size_t len) {
         return;
     }
     
-    /* Hhndle based on message type */
+    /* handle based on message type */
     switch (oh->type) {
         case OFPT_HELLO:
             handle_hello(sw, oh);
