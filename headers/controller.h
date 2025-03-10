@@ -65,11 +65,19 @@ struct mac_entry {
     UT_hash_handle hh; /* makes this structure hashable */
 }; 
 
+struct network_topology {
+    igraph_t graph;                /* iGraph object representing the network */
+    pthread_mutex_t lock;          /* lock for thread safety */
+    
+    igraph_vector_t dpid_to_vertex;  /* map datapath IDs to vertex IDs */
+};
+
 /* global variables */
-struct switch_info switches[MAX_SWITCHES];
-pthread_mutex_t switches_lock = PTHREAD_MUTEX_INITIALIZER;
-int server_socket;
-volatile int running = 1; /* for controller clean up and running */
+extern struct switch_info switches[MAX_SWITCHES];
+extern pthread_mutex_t switches_lock;
+extern int server_socket;
+extern volatile int running; /* for controller clean up and running */
+extern struct network_topology topology;
 
 /* function prototypes */
 void signal_handler(int signum); 
@@ -81,6 +89,7 @@ void init_controller(int port);
 void *accept_handler(void *arg); 
 void *switch_handler(void *arg);
  
+/* messaging */
 void send_hello(struct switch_info *sw);
 void handle_hello(struct switch_info *sw, struct ofp_header *oh);
 
@@ -94,7 +103,23 @@ void handle_echo_request(struct switch_info *sw, struct ofp_header *oh);
 bool send_echo_request(struct switch_info *sw);
 void handle_echo_reply(struct switch_info *sw, struct ofp_header *oh);
 
+/* flows */
 void handle_packet_in(struct switch_info *sw, struct ofp_packet_in *pi);
 void handle_port_status(struct switch_info *sw, struct ofp_port_status *ps);
+
+/* topology */
+void init_topology();
+void handle_switch_join(struct switch_info *sw);
+void handle_switch_disconnect(struct switch_info *sw); 
+void handle_port_change(struct switch_info *sw, uint16_t src_port_no, bool is_up); 
+
+igraph_integer_t find_vertex_by_dpid(uint64_t dpid); 
+void add_or_update_link(uint64_t src_dpid, uint16_t src_port, uint64_t dst_dpid, uint16_t dst_port);
+void add_vertex(uint64_t dpid); 
+void remove_links_for_port(uint64_t dpid, uint16_t src_port_no);
+void remove_all_switch_links(uint64_t dpid);
+
+void send_lldp_packet(struct switch_info *sw, uint16_t port_no); 
+
 
 #endif

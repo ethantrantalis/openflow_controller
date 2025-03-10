@@ -67,6 +67,8 @@
 #include <stdbool.h>
 #include <sys/time.h>
 #include <time.h>
+#include </opt/homebrew/Cellar/igraph/0.10.15_1/include/igraph/igraph.h>
+#include "headers/uthash.h"
 
 #if defined(__linux__)
     #include <endian.h>
@@ -79,6 +81,13 @@
 #include "headers/openflow.h"
 
 #define DEF_PORT 6653
+
+/* global variables */
+struct switch_info switches[MAX_SWITCHES];
+pthread_mutex_t switches_lock = PTHREAD_MUTEX_INITIALIZER;
+int server_socket;
+volatile int running = 1; /* for controller clean up and running */
+struct network_topology topology;
 
 struct mac_entry *mac_table = NULL;
 
@@ -343,9 +352,11 @@ void *switch_handler(void *arg) {
         int ret = select(sw->socket + 1, &readfds, NULL, NULL, &tv);
         
         now = time(NULL);
+
+        /* ----------------------------------------------- ECHO INTERVAL ------------------------------------------- */
         
         /* handle echo timing independent of message receipt */
-        if (sw->features_received) {
+        if (sw->features_received && sw->hello_received) {
             if (next_echo == 0) {
                 next_echo = now + ECHO_INTERVAL;
             }
@@ -360,6 +371,8 @@ void *switch_handler(void *arg) {
                 }
             }
         }
+
+        /* ---------------------------------------------- INCOMING MESSAGE ----------------------------------------- */
         
         /* handle incoming messages if any */
         if (ret > 0 && FD_ISSET(sw->socket, &readfds)) {
@@ -400,6 +413,8 @@ void *switch_handler(void *arg) {
     printf("Switch handler exiting\n");
     return NULL;
 }
+
+/* ------------------------------------------------- MESSAGE IN/OUT ------------------------------------------------ */
 
 /* handle incoming OpenFlow message, see while loop in switch handler */
 void handle_switch_message(struct switch_info *sw, uint8_t *msg, size_t len) {
@@ -455,6 +470,8 @@ void send_openflow_msg(struct switch_info *sw, void *msg, size_t len) {
     pthread_mutex_unlock(&sw->lock);
 }
 
+/* ------------------------------------------------------ HELLO ---------------------------------------------------- */
+
 /* send HELLO message */
 void send_hello(struct switch_info *sw) {
     struct ofp_header hello;
@@ -490,6 +507,8 @@ void handle_hello(struct switch_info *sw, struct ofp_header *oh) {
         sw->active = 0;  /* mark for disconnection */
     }
 }
+
+/* ---------------------------------------------------- FEATURES --------------------------------------------------- */
 
 /* send features request */
 void send_features_request(struct switch_info *sw) {
@@ -529,6 +548,7 @@ void handle_features_reply(struct switch_info *sw, struct ofp_switch_features *f
     log_msg("  Number of ports: %d\n", num_ports);
     
     /* print capabilities for debugging purposes */
+    /*
     log_msg("  Capabilities:\n");
     uint32_t capabilities = ntohl(features->capabilities);
     if (capabilities & OFPC_FLOW_STATS)    log_msg("    - Flow statistics\n");
@@ -538,9 +558,11 @@ void handle_features_reply(struct switch_info *sw, struct ofp_switch_features *f
     if (capabilities & OFPC_IP_REASM)      log_msg("    - IP reasm\n");
     if (capabilities & OFPC_QUEUE_STATS)   log_msg("    - Queue statistics\n");
     if (capabilities & OFPC_ARP_MATCH_IP)  log_msg("    - ARP match IP\n");
-    
+    */
+
     /* Print ports for debugging purposes */
-    for (int i = 0; i < num_ports; i++) {
+    int i;
+    for (i = 0; i < num_ports; i++) {
         struct ofp_phy_port *port = &sw->ports[i];
         log_msg("\nPort %d:\n", ntohs(port->port_no));
         log_msg("  Name: %s\n", port->name);
@@ -555,6 +577,8 @@ void handle_features_reply(struct switch_info *sw, struct ofp_switch_features *f
             log_msg("  State: Link up\n");
             
         /* print port features */
+        
+        /*
         uint32_t curr = ntohl(port->curr);
         log_msg("  Current features:\n");
         if (curr & OFPPF_10MB_HD)    log_msg("    - 10Mb half-duplex\n");
@@ -569,8 +593,11 @@ void handle_features_reply(struct switch_info *sw, struct ofp_switch_features *f
         if (curr & OFPPF_AUTONEG)    log_msg("    - Auto-negotiation\n");
         if (curr & OFPPF_PAUSE)      log_msg("    - Pause\n");
         if (curr & OFPPF_PAUSE_ASYM) log_msg("    - Asymmetric pause\n");
+        */
     }
 }
+
+/* ------------------------------------------------------- ECHO ---------------------------------------------------- */
 
 /* send echo request */
 bool send_echo_request(struct switch_info *sw) {
@@ -630,6 +657,8 @@ void handle_echo_request(struct switch_info *sw, struct ofp_header *oh) {
     
     send_openflow_msg(sw, &echo, sizeof(echo));
 }
+
+/* ------------------------------------------------ SWITCH MESSAGING ----------------------------------------------- */
 
 /* handle incoming packets from the switch */
 void handle_packet_in(struct switch_info *sw, struct ofp_packet_in *pi) {
