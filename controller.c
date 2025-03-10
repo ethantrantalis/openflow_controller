@@ -49,8 +49,8 @@
 * 8. The send_echo_request function sends an ECHO_REQUEST to the switch.
 *  - The function creates an ECHO_REQUEST message and sends it to the switch.
 */
-#include "smartalloc.h"
-#include "checksum.h"
+#include "headers/smartalloc.h"
+#include "headers/checksum.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -75,10 +75,35 @@
     #define be64toh(x) OSSwapBigToHostInt64(x)
 #endif
 
-#include "controller.h"
-#include "openflow.h"
+#include "headers/controller.h"
+#include "headers/openflow.h"
 
 #define DEF_PORT 6653
+
+struct mac_entry *mac_table = NULL;
+
+/* add or update an entry */
+void add_mac(uint8_t *mac, uint64_t dpid) {
+    struct mac_entry *entry;
+    
+    HASH_FIND(hh, mac_table, mac, MAC_ADDR_LEN, entry);
+    if (entry == NULL) {
+        entry = malloc(sizeof(struct mac_entry));
+        memcpy(entry->mac, mac, MAC_ADDR_LEN);
+        HASH_ADD(hh, mac_table, mac, MAC_ADDR_LEN, entry);
+    }
+    
+    /* add other values of update values if already exists */
+    entry->switch_dpid = dpid;
+    entry->last_seen = time(NULL);
+}
+
+/* find an entry */
+struct mac_entry *find_mac(uint8_t *mac) {
+    struct mac_entry *entry;
+    HASH_FIND(hh, mac_table, mac, MAC_ADDR_LEN, entry);
+    return entry;
+}
 
 
 /* signal handler */
@@ -231,8 +256,6 @@ void init_controller(int port) {
     }
 }
 
-/* -------------------------------------------------- Initialize Threads ------------------------------------------------------- */
-
 /* accept incoming switch connections, spawns new threads for each connection */
 void *accept_handler(void *arg) {
     struct sockaddr_in addr;
@@ -378,8 +401,6 @@ void *switch_handler(void *arg) {
     return NULL;
 }
 
-/* ----------------------------------------------- Handle Openflow Messages ---------------------------------------------------- */
-
 /* handle incoming OpenFlow message, see while loop in switch handler */
 void handle_switch_message(struct switch_info *sw, uint8_t *msg, size_t len) {
     struct ofp_header *oh = (struct ofp_header *)msg;
@@ -422,6 +443,31 @@ void handle_switch_message(struct switch_info *sw, uint8_t *msg, size_t len) {
     }
 }
 
+/* default function for sending OpenFlow message */
+void send_openflow_msg(struct switch_info *sw, void *msg, size_t len) {
+
+    pthread_mutex_lock(&sw->lock);      /* lock threads for safety */
+    if (sw->active) {
+        if (send(sw->socket, msg, len, 0) < 0) {      /* send to socket at switch */
+            perror("Failed to send message");
+        }
+    }
+    pthread_mutex_unlock(&sw->lock);
+}
+
+/* send HELLO message */
+void send_hello(struct switch_info *sw) {
+    struct ofp_header hello;
+    
+    hello.version = OFP_VERSION;
+    hello.type = OFPT_HELLO;
+    hello.length = htons(sizeof(hello));
+    hello.xid = htonl(0);
+    
+    /* use OpenFlow hello packet */
+    send_openflow_msg(sw, &hello, sizeof(hello));
+}
+
 /* handle HELLO message */
 void handle_hello(struct switch_info *sw, struct ofp_header *oh) {
     sw->version = oh->version;
@@ -445,19 +491,22 @@ void handle_hello(struct switch_info *sw, struct ofp_header *oh) {
     }
 }
 
-/* handle echo requests/replies */
-void handle_echo_request(struct switch_info *sw, struct ofp_header *oh) {
-    struct ofp_header echo;
+/* send features request */
+void send_features_request(struct switch_info *sw) {
+    struct ofp_header freq;
     
-    /* simply change the type to reply and send it back */
-    memcpy(&echo, oh, sizeof(echo));
-    echo.type = OFPT_ECHO_REPLY;
+    freq.version = OFP_VERSION;
+    freq.type = OFPT_FEATURES_REQUEST;
+    freq.length = htons(sizeof(freq));
+    freq.xid = htonl(1);
     
-    send_openflow_msg(sw, &echo, sizeof(echo));
+    send_openflow_msg(sw, &freq, sizeof(freq));
 }
 
 /* handle features reply */
 void handle_features_reply(struct switch_info *sw, struct ofp_switch_features *features) {
+
+    sw->features_received = 1;
     sw->datapath_id = be64toh(features->datapath_id);
     sw->n_tables = features->n_tables;
     
@@ -523,6 +572,65 @@ void handle_features_reply(struct switch_info *sw, struct ofp_switch_features *f
     }
 }
 
+/* send echo request */
+bool send_echo_request(struct switch_info *sw) {
+
+    if (!sw->echo_pending) {
+        struct ofp_header echo;
+        
+        echo.version = OFP_VERSION;
+        echo.type = OFPT_ECHO_REQUEST;
+        echo.length = htons(sizeof(echo));
+        echo.xid = htonl(sw->last_echo_xid++);
+        
+        sw->echo_pending = true;
+        
+        pthread_mutex_lock(&sw->lock);
+        bool success = false;
+        sw->last_echo = time(NULL);
+        if (sw->active) {
+            success = (send(sw->socket, &echo, sizeof(echo), 0) >= 0);
+            if (!success) {
+                sw->echo_pending = false;  /* reset if send failed */
+            }
+
+            log_msg("Echo request sent to switch %016" PRIx64 " (XID: %u)\n", 
+                    sw->datapath_id, ntohl(echo.xid));
+        }
+        pthread_mutex_unlock(&sw->lock);
+        
+        return success;
+    }
+    log_msg("Echo request already pending for switch %016" PRIx64 "\n", sw->datapath_id);
+    return false;
+}
+
+/* handle echo reply messages */
+void handle_echo_reply(struct switch_info *sw, struct ofp_header *oh) {
+    pthread_mutex_lock(&sw->lock);
+    
+    /* update both last reply and last echo time */
+    sw->last_echo_reply = time(NULL);
+    sw->echo_pending = false;  /* Mark that anothe echo can be send, meaning echos have vbeen recienved */
+
+    /* for debugging */
+    log_msg("Echo reply received from switch %016" PRIx64 " (XID: %u)\n", 
+            sw->datapath_id, ntohl(oh->xid));
+    
+    pthread_mutex_unlock(&sw->lock);
+}
+
+/* handle echo requests */
+void handle_echo_request(struct switch_info *sw, struct ofp_header *oh) {
+    struct ofp_header echo;
+    
+    /* simply change the type to reply and send it back */
+    memcpy(&echo, oh, sizeof(echo));
+    echo.type = OFPT_ECHO_REPLY;
+    
+    send_openflow_msg(sw, &echo, sizeof(echo));
+}
+
 /* handle incoming packets from the switch */
 void handle_packet_in(struct switch_info *sw, struct ofp_packet_in *pi) {
     if (!pi) {
@@ -561,21 +669,6 @@ void handle_packet_in(struct switch_info *sw, struct ofp_packet_in *pi) {
     log_msg("  In Port: %u\n", in_port);
     log_msg("  Reason: %s\n", reason_str);
 
-    
-    pthread_mutex_unlock(&sw->lock);
-}
-
-/* handle echo reply messages */
-void handle_echo_reply(struct switch_info *sw, struct ofp_header *oh) {
-    pthread_mutex_lock(&sw->lock);
-    
-    /* update both last reply and last echo time */
-    sw->last_echo_reply = time(NULL);
-    sw->echo_pending = false;  /* Mark that anothe echo can be send, meaning echos have vbeen recienved */
-
-    /* for debugging */
-    log_msg("Echo reply received from switch %016" PRIx64 " (XID: %u)\n", 
-            sw->datapath_id, ntohl(oh->xid));
     
     pthread_mutex_unlock(&sw->lock);
 }
@@ -652,77 +745,14 @@ void handle_port_status(struct switch_info *sw, struct ofp_port_status *ps) {
     pthread_mutex_unlock(&sw->lock);
 }
 
-/* ------------------------------------------------ Send Openflow Messages ----------------------------------------------------- */
 
-/* default function for sending OpenFlow message */
-void send_openflow_msg(struct switch_info *sw, void *msg, size_t len) {
 
-    pthread_mutex_lock(&sw->lock);      /* lock threads for safety */
-    if (sw->active) {
-        if (send(sw->socket, msg, len, 0) < 0) {      /* send to socket at switch */
-            perror("Failed to send message");
-        }
-    }
-    pthread_mutex_unlock(&sw->lock);
-}
 
-/* send HELLO message */
-void send_hello(struct switch_info *sw) {
-    struct ofp_header hello;
-    
-    hello.version = OFP_VERSION;
-    hello.type = OFPT_HELLO;
-    hello.length = htons(sizeof(hello));
-    hello.xid = htonl(0);
-    
-    /* use OpenFlow hello packet */
-    send_openflow_msg(sw, &hello, sizeof(hello));
-}
 
-/* add echo request/reply support */
-bool send_echo_request(struct switch_info *sw) {
 
-    if (!sw->echo_pending) {
-        struct ofp_header echo;
-        
-        echo.version = OFP_VERSION;
-        echo.type = OFPT_ECHO_REQUEST;
-        echo.length = htons(sizeof(echo));
-        echo.xid = htonl(sw->last_echo_xid++);
-        
-        sw->echo_pending = true;
-        
-        pthread_mutex_lock(&sw->lock);
-        bool success = false;
-        sw->last_echo = time(NULL);
-        if (sw->active) {
-            success = (send(sw->socket, &echo, sizeof(echo), 0) >= 0);
-            if (!success) {
-                sw->echo_pending = false;  /* reset if send failed */
-            }
 
-            log_msg("Echo request sent to switch %016" PRIx64 " (XID: %u)\n", 
-                    sw->datapath_id, ntohl(echo.xid));
-        }
-        pthread_mutex_unlock(&sw->lock);
-        
-        return success;
-    }
-    log_msg("Echo request already pending for switch %016" PRIx64 "\n", sw->datapath_id);
-    return false;
-}
 
-/* send features request */
-void send_features_request(struct switch_info *sw) {
-    struct ofp_header freq;
-    
-    freq.version = OFP_VERSION;
-    freq.type = OFPT_FEATURES_REQUEST;
-    freq.length = htons(sizeof(freq));
-    freq.xid = htonl(1);
-    
-    send_openflow_msg(sw, &freq, sizeof(freq));
-}
+
 
 
 
