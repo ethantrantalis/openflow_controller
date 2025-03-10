@@ -633,7 +633,6 @@ struct path* calculate_shortest_path(uint64_t src_dpid, uint64_t dst_dpid) {
     
     /* find destination in distances */
     int dst_idx = -1;
-    int i;
     for (i = 0; i < global_topology.num_nodes; i++) {
         if (distances[i].dpid == dst_dpid) {
             dst_idx = i;
