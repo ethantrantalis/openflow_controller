@@ -119,6 +119,7 @@ struct mac_entry *find_mac(uint8_t *mac) {
 void signal_handler(int signum) {
     printf("\nShutdown signal received, cleaning up...\n");
     running = 0;
+
 }
 
 /* thread-safe logging function */
@@ -148,6 +149,10 @@ void log_msg(const char *format, ...) {
 
 /* clean up function for threads and and switches*/
 void cleanup_switch(struct switch_info *sw) {
+
+    /* remove from topology first */
+    handle_switch_disconnect(sw);
+
     pthread_mutex_lock(&sw->lock);
     if (sw->active) {
         sw->active = 0;
@@ -188,7 +193,8 @@ int main(int argc, char *argv[]) {
     }
     
     /* cleanup threads */
-    for (int i = 0; i < MAX_SWITCHES; i++) {
+    int i;
+    for (i = 0; i < MAX_SWITCHES; i++) {
         pthread_mutex_lock(&switches[i].lock);
         if (switches[i].active) {
             switches[i].active = 0;
@@ -198,6 +204,13 @@ int main(int argc, char *argv[]) {
         pthread_mutex_unlock(&switches[i].lock);
         pthread_mutex_destroy(&switches[i].lock);
     }
+
+    /* clean global topology structure */
+    pthread_mutex_lock(&topology.lock);
+    igraph_destroy(&topology.graph);
+    igraph_vector_destroy(&topology.dpid_to_vertex);
+    pthread_mutex_unlock(&topology.lock);
+    pthread_mutex_destroy(&topology.lock);
     
     /* close server socket */
     close(server_socket);
@@ -254,6 +267,9 @@ void init_controller(int port) {
         perror("Failed to listen");
         exit(1);
     }
+
+    /* create the global topology so new sitches can call its functions */
+    init_topology();
     
     /* start accept thread, creates a thread that listens for new connections
      * the handler will create new threads for each new connection 
@@ -398,17 +414,8 @@ void *switch_handler(void *arg) {
             handle_switch_message(sw, buf, len);
         }
     }
-    
-    /* clean up connection */
-    pthread_mutex_lock(&sw->lock);
-    if (sw->active) {
-        sw->active = 0;
-        close(sw->socket);
-        free(sw->ports);
-        sw->ports = NULL;
-        sw->num_ports = 0;
-    }
-    pthread_mutex_unlock(&sw->lock);
+
+    cleanup_switch(sw);
     
     printf("Switch handler exiting\n");
     return NULL;
@@ -595,6 +602,9 @@ void handle_features_reply(struct switch_info *sw, struct ofp_switch_features *f
         if (curr & OFPPF_PAUSE_ASYM) log_msg("    - Asymmetric pause\n");
         */
     }
+
+    /* add switch to topology */
+    handle_switch_join(sw);
 }
 
 /* ------------------------------------------------------- ECHO ---------------------------------------------------- */
@@ -660,48 +670,6 @@ void handle_echo_request(struct switch_info *sw, struct ofp_header *oh) {
 
 /* ------------------------------------------------ SWITCH MESSAGING ----------------------------------------------- */
 
-/* handle incoming packets from the switch */
-void handle_packet_in(struct switch_info *sw, struct ofp_packet_in *pi) {
-    if (!pi) {
-        log_msg("Error: Null packet_in message\n");
-        return;
-    }
-
-    /* lock switch for thread safety while accessing switch info */
-    pthread_mutex_lock(&sw->lock);
-    
-    /* increment packet counter */
-    sw->packet_in_count++;
-    
-    /* extract basic packet information */
-    uint32_t buffer_id = ntohl(pi->buffer_id);
-    uint16_t total_len = ntohs(pi->total_len);
-    uint16_t in_port = ntohs(pi->in_port);
-    
-    /* get reason for packet in */
-    const char *reason_str = "Unknown";
-    switch (pi->reason) {
-        case OFPR_NO_MATCH:
-            reason_str = "No matching flow";
-            break;
-        case OFPR_ACTION:
-            reason_str = "Action explicitly output to controller";
-            break;
-        default:
-            reason_str = "Unknown reason";
-    }
-    
-    /* log packet information */
-    log_msg("\nPACKET_IN from switch %016" PRIx64 ":\n", sw->datapath_id);
-    log_msg("  Buffer ID: %u\n", buffer_id);
-    log_msg("  Total Length: %u bytes\n", total_len);
-    log_msg("  In Port: %u\n", in_port);
-    log_msg("  Reason: %s\n", reason_str);
-
-    
-    pthread_mutex_unlock(&sw->lock);
-}
-
 /* handle port status changes */
 void handle_port_status(struct switch_info *sw, struct ofp_port_status *ps) {
     if (!ps) {
@@ -730,12 +698,20 @@ void handle_port_status(struct switch_info *sw, struct ofp_port_status *ps) {
     switch (ps->reason) {
         case OFPPR_ADD:
             reason_str = "PORT ADDED";
+            handle_port_change(sw, ntohs(port->port_no), true);
+            log_msg("Port %hu added for switch %016" PRIx64 "\n",port->port_no, sw->datapath_id);
             break;
         case OFPPR_DELETE:
             reason_str = "PORT REMOVED";
+            handle_port_change(sw, ntohs(port->port_no), false);
+            log_msg("Port %hu removed for switch %016" PRIx64 "\n",port->port_no, sw->datapath_id);
             break;
         case OFPPR_MODIFY:
+
+            /* the handle discovery packet function handles both adding and updateding connections */
             reason_str = "PORT MODIFIED";
+            handle_port_change(sw, ntohs(port->port_no), true);
+            log_msg("Port %hu modified for switch %016" PRIx64 "\n",port->port_no, sw->datapath_id);
             break;
         default:
             reason_str = "UNKNOWN";
@@ -762,7 +738,8 @@ void handle_port_status(struct switch_info *sw, struct ofp_port_status *ps) {
             
         case OFPPR_MODIFY:
             /* update existing port information */
-            for (int i = 0; i < sw->num_ports; i++) {
+            int i;
+            for (i = 0; i < sw->num_ports; i++) {
                 if (ntohs(sw->ports[i].port_no) == ntohs(port->port_no)) {
                     memcpy(&sw->ports[i], port, sizeof(struct ofp_phy_port));
                     break;
@@ -770,6 +747,62 @@ void handle_port_status(struct switch_info *sw, struct ofp_port_status *ps) {
             }
             break;
     }
+    
+    pthread_mutex_unlock(&sw->lock);
+}
+
+/* handle incoming packets from the switch */
+void handle_packet_in(struct switch_info *sw, struct ofp_packet_in *pi) {
+    if (!pi) {
+        log_msg("Error: Null packet_in message\n");
+        return;
+    }
+
+    /* lock switch for thread safety while accessing switch info */
+    pthread_mutex_lock(&sw->lock);
+    
+    /* increment packet counter */
+    sw->packet_in_count++;
+
+    /* first check if its a topology discovery packet */
+    if(is_topology_discovery_packet(pi->data, ntohs(pi->total_len))) {
+        handle_discovery_packet(sw, pi);
+        log_msg("Topology discovery packet received from switch %016" PRIx64 "\n", sw->datapath_id);
+        pthread_mutex_unlock(&sw->lock);
+        return; /* return succesfully */
+    }
+    
+    /* extract basic packet information */
+    uint32_t buffer_id = ntohl(pi->buffer_id);
+    uint16_t total_len = ntohs(pi->total_len);
+    uint16_t in_port = ntohs(pi->in_port);
+
+    /* extract information used for the flow resulting from this packet */
+    uint8_t *eth_frame = pi->data;
+    uint8_t *dst_mac = eth_frame + ETH_DST_OFFSET;
+    uint8_t *src_mac = eth_frame + ETH_SRC_OFFSET;
+    uint16_t eth_type = ntohs(*(uint16_t *)(eth_frame + ETH_ETHERTYPE_OFFSET));
+    
+    /* get reason for packet in */
+    const char *reason_str = "Unknown";
+    switch (pi->reason) {
+        case OFPR_NO_MATCH:
+            reason_str = "No matching flow";
+            break;
+        case OFPR_ACTION:
+            reason_str = "Action explicitly output to controller";
+            break;
+        default:
+            reason_str = "Unknown reason";
+    }
+    
+    /* log packet information */
+    log_msg("\nPACKET_IN from switch %016" PRIx64 ":\n", sw->datapath_id);
+    log_msg("  Buffer ID: %u\n", buffer_id);
+    log_msg("  Total Length: %u bytes\n", total_len);
+    log_msg("  In Port: %u\n", in_port);
+    log_msg("  Reason: %s\n", reason_str);
+
     
     pthread_mutex_unlock(&sw->lock);
 }

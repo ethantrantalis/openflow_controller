@@ -25,6 +25,20 @@
 #define CLEANUP_INTERVAL   30
 #define MAC_ADDR_LEN 6
 
+/* lldp packet strcutre offsets */
+#define LLDP_DST_MAC_OFFSET 0
+#define LLDP_SRC_MAC_OFFSET 6
+#define LLDP_ETHERTYPE_OFFSET 12
+#define LLDP_MAGIC_OFFSET 14
+#define LLDP_TYPE_OFFSET 18
+#define LLDP_SRC_DPID_OFFSET 19
+#define LLDP_SRC_PORT_OFFSET 27
+
+/* ethernet packet structure offsets */
+#define ETH_DST_OFFSET 0
+#define ETH_SRC_OFFSET 6
+#define ETH_ETHERTYPE_OFFSET 12
+
 /* structure to track connected switches */
 struct switch_info {
     int socket;                  /* connection socket */

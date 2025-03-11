@@ -55,7 +55,7 @@ void handle_switch_join(struct switch_info *sw) {
     for (i = 0; i < sw->num_ports; i++) { /* handle lldp packet will handle edge creation */
         uint16_t port_no = ntohs(sw->ports[i].port_no);
         if (port_no < OFPP_MAX && !(ntohl(sw->ports[i].state) & OFPPS_LINK_DOWN)) {
-            send_lldp_packet(sw, port_no);
+            send_topology_discovery_packet(sw, port_no);
         }
     }
 }
@@ -84,7 +84,7 @@ void handle_port_change(struct switch_info *sw, uint16_t src_port_no, bool is_up
     
     if (is_up) {
         /* port came up - send LLDP to discover new links */
-        send_lldp_packet(sw, src_port_no);
+        send_topology_discovery_packet(sw, src_port_no);
     } else {
         /* port went down - remove any associated links */
         remove_links_for_port(sw->datapath_id, src_port_no);
@@ -214,11 +214,164 @@ void remove_all_switch_links(uint64_t dpid){
     pthread_mutex_unlock(&topology.lock);
 };
 
-void send_lldp_packet(struct switch_info *sw, uint16_t port_no) {
-    /* create the LLDP packet */
-    uint8_t lldp_packet[128];
-    int len = 0;
+/* ----------------------------------------- TOPOLOGY DISCOVERY FUNCTIONS ------------------------------------------ */
+void send_topology_discovery_packet(struct switch_info *sw, uint16_t port_no) {
+
+
+    /* 
+     * ofp_packet_out - tells a switch to send the packet
+     * ofp_action_output - tells a switch to output the message from specific port
+     * ethernet - for L2 routing
+     * custom LLDP - contains src dpid, src port, lldp type, magic number (OFTO)  
+     * */
+
+    /* create a simplified discovery packet */
+    uint8_t disc_packet[64] = {0};
+    int packet_size = 0;
     
-    /* send the packet */
-    send_openflow_msg(sw, lldp_packet, len);
+    /* ethernet header */
+    uint8_t dst_mac[MAC_ADDR_LEN] = {0x01, 0x80, 0xC2, 0x00, 0x00, 0x0E}; /* LLDP multicast */
+    memcpy(disc_packet + packet_size, dst_mac, MAC_ADDR_LEN);
+    packet_size += 6; /* increment the size for offsets */
+    
+    /* port MAC address for more specific forwarding */
+    uint8_t src_mac[MAC_ADDR_LEN] = {0}; 
+    int i;
+    for (i = 0; i < sw->num_ports; i++) { /* find the port struct in the swtich to get more info */
+        if (ntohs(sw->ports[i].port_no) == port_no) {
+            memcpy(src_mac, sw->ports[i].hw_addr, 6);
+            break;
+        }
+    }
+    memcpy(disc_packet + packet_size, src_mac, MAC_ADDR_LEN);
+    packet_size += 6; /* increment the size for offsets */
+    
+    /* set EtherType to commone LLDP type (0x88CC) */
+    disc_packet[packet_size++] = 0x88;
+    disc_packet[packet_size++] = 0xCC;
+    
+
+    /* start of custom packet structure */
+    
+    /* magic number to identify our custom packets */
+    uint32_t magic = htonl(0x4F46544F); /* "OFTO" */
+    memcpy(disc_packet + packet_size, &magic, 4);
+    packet_size += 4;
+    
+    /* packet type: 1 = topology discovery */
+    disc_packet[packet_size++] = 0x01;
+    
+    /* source datapath ID (8 bytes) */
+    uint64_t dpid_net = htobe64(sw->datapath_id);
+    memcpy(disc_packet + packet_size, &dpid_net, 8);
+    packet_size += 8;
+    
+    /* source port number */
+    uint16_t port_net = htons(port_no);
+    memcpy(disc_packet + packet_size, &port_net, 2);
+    packet_size += 2;
+    
+    /*  create packet_out message */
+    struct ofp_action_output action;
+    memset(&action, 0, sizeof(action));
+    action.type = htons(OFPAT_OUTPUT);
+    action.len = htons(sizeof(action));
+    action.port = htons(port_no);
+    action.max_len = htons(0);
+    
+    int total_len = sizeof(struct ofp_packet_out) + sizeof(action) + packet_size;
+    struct ofp_packet_out *po = malloc(total_len);
+    if (!po) {
+        log_msg("Error: Failed to allocate memory for packet_out message\n");
+        return;
+    }
+    
+    memset(po, 0, total_len);
+    po->header.version = OFP_VERSION;
+    po->header.type = OFPT_PACKET_OUT;
+    po->header.length = htons(total_len);
+    po->header.xid = htonl(0);
+    
+    po->buffer_id = htonl(0xFFFFFFFF); /* OFP_NO_BUFFER */
+    po->in_port = htons(OFPP_NONE);
+    po->actions_len = htons(sizeof(action));
+    
+    memcpy((uint8_t*)po + sizeof(struct ofp_packet_out), &action, sizeof(action));
+    memcpy((uint8_t*)po + sizeof(struct ofp_packet_out) + sizeof(action), 
+           disc_packet, packet_size);
+    
+    send_openflow_msg(sw, po, total_len);
+    
+    log_msg("Sent discovery packet from switch %016" PRIx64 " port %d\n", 
+            sw->datapath_id, port_no);
+    
+    free(po);
 }
+
+/* helper function to verify that a packet is link layer discovery */
+bool is_topology_discovery_packet(uint8_t *data, size_t len) {
+    if (len < 26) return false;
+    
+    /* check destination MAC is the multicast address */
+    uint8_t expected_dst_mac[MAC_ADDR_LEN] = {0x01, 0x80, 0xC2, 0x00, 0x00, 0x0E}; 
+    if (memcmp(data, expected_dst_mac, MAC_ADDR_LEN) != 0) return false; /* lldp multicast is ethernet dst */
+    
+    /* check EtherType */
+    if (data[LLDP_ETHERTYPE_OFFSET] != 0x88 || data[LLDP_ETHERTYPE_OFFSET + 1] != 0xCC) return false; /* should be right after dst mac and src mac */
+    
+    /* check magic number */
+    uint32_t magic;
+    memcpy(&magic, data + LLDP_MAGIC_OFFSET, 4); /* 14 is dst mac (6) + src mac (6) + type (2) */
+    return ntohl(magic) == 0x4F46544F; /* "OFTO" */
+}
+
+/* function to gain data from a lldp packet (pass by reference)*/
+bool extract_discovery_packet_info(uint8_t *data, size_t len, uint64_t *src_dpid, uint16_t *src_port) {
+    if (len < 29) return false;
+    
+    /* extract source datapath ID */
+
+    /* 19 is dst mac (6) + src mac (6) + type (2) + magic (4) + lldp type (1) */
+    memcpy(src_dpid, data + LLDP_SRC_DPID_OFFSET, 8); 
+    *src_dpid = be64toh(*src_dpid);
+    
+    /* extract source port */
+
+    /* 27 is dst mac (6) + src mac (6) + type (2) + magic (4) + lldp type (1) + src_dpid (8)*/
+    memcpy(src_port, data + LLDP_SRC_PORT_OFFSET, 2);
+    *src_port = ntohs(*src_port);
+    
+    return true;
+}
+
+void handle_discovery_packet(struct switch_info *sw, struct ofp_packet_in *pi) {
+    uint64_t src_dpid;
+    uint16_t src_port;
+    uint64_t dst_dpid = sw->datapath_id;
+    uint16_t dst_port = ntohs(pi->in_port);
+    
+    /* extract information from discovery packet, passed reference items */
+    if (!extract_discovery_packet_info(pi->data, ntohs(pi->total_len), &src_dpid, &src_port)) {
+        log_msg("Failed to extract information from discovery packet\n");
+        return;
+    }
+    
+    log_msg("Received discovery packet: Switch %016" PRIx64 " Port %d -> Switch %016" PRIx64 " Port %d\n",
+            src_dpid, src_port, dst_dpid, dst_port);
+    
+    /* update topology with this link information */
+    add_or_update_link(src_dpid, src_port, dst_dpid, dst_port);
+}
+
+/* 
+mst
+igraph_spanning_tree(&topology.graph, &mst_graph, -1)
+
+unicast
+igraph_shortest_paths_unweighted(&topology.graph, &distances, src_vertex, to_vertices, IGRAPH_OUT)
+
+multiple calculations: 
+Where src_vertices and to_vertices are vertex selectors specifying the source and target vertices.
+
+igraph_shortest_paths_unweighted(&topology.graph, &distances, src_vertices, to_vertices, IGRAPH_OUT)
+*/
