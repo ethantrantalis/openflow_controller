@@ -75,6 +75,7 @@ struct switch_info {
 struct mac_entry {
     uint8_t mac[MAC_ADDR_LEN]; /* key */
     uint64_t switch_dpid;
+    uint16_t port_no;
     time_t last_seen;
     UT_hash_handle hh; /* makes this structure hashable */
 }; 
@@ -97,6 +98,9 @@ extern struct network_topology topology;
 void signal_handler(int signum); 
 void log_msg(const char *format, ...);
 void cleanup_switch(struct switch_info *sw);
+
+void add_or_update_mac(uint8_t *mac, uint64_t dpid);
+struct mac_entry *find_mac(uint8_t *mac);
 
 int main(int argc, char *argv[]);
 void init_controller(int port); 
@@ -132,7 +136,10 @@ void add_vertex(uint64_t dpid);
 void remove_links_for_port(uint64_t dpid, uint16_t src_port_no);
 void remove_all_switch_links(uint64_t dpid);
 
-void send_lldp_packet(struct switch_info *sw, uint16_t port_no); 
+void send_topology_discovery_packet(struct switch_info *sw, uint16_t port_no);
+bool is_topology_discovery_packet(uint8_t *data, size_t len);
+bool extract_discovery_packet_info(uint8_t *data, size_t len, uint64_t *src_dpid, uint16_t *src_port);
+void handle_discovery_packet(struct switch_info *sw, struct ofp_packet_in *pi);
 
 
 #endif

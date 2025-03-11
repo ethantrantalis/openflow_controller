@@ -20,6 +20,14 @@
 #include "headers/uthash.h"
 #include "headers/controller.h"
 
+#if defined(__linux__)
+    #include <endian.h>
+#elif defined(__APPLE__)
+    #include <libkern/OSByteOrder.h>
+    #define be64toh(x) OSSwapBigToHostInt64(x)
+    #define htobe64(x) OSSwapHostToBigInt64(x)
+#endif
+
 void init_topology(){
 
     /* initialize the mutex */
@@ -271,7 +279,7 @@ void send_topology_discovery_packet(struct switch_info *sw, uint16_t port_no) {
     memcpy(disc_packet + packet_size, &port_net, 2);
     packet_size += 2;
     
-    /*  create packet_out message */
+    /*  create action ouput message */
     struct ofp_action_output action;
     memset(&action, 0, sizeof(action));
     action.type = htons(OFPAT_OUTPUT);

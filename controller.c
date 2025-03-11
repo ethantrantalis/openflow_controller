@@ -92,7 +92,7 @@ struct network_topology topology;
 struct mac_entry *mac_table = NULL;
 
 /* add or update an entry */
-void add_mac(uint8_t *mac, uint64_t dpid) {
+void add_or_update_mac(uint8_t *mac, uint64_t dpid, uint16_t port_no) {
     struct mac_entry *entry;
     
     HASH_FIND(hh, mac_table, mac, MAC_ADDR_LEN, entry);
@@ -104,6 +104,7 @@ void add_mac(uint8_t *mac, uint64_t dpid) {
     
     /* add other values of update values if already exists */
     entry->switch_dpid = dpid;
+    entry->port_no = port_no;
     entry->last_seen = time(NULL);
 }
 
@@ -677,6 +678,8 @@ void handle_port_status(struct switch_info *sw, struct ofp_port_status *ps) {
         return;
     }
 
+    int i;
+
     pthread_mutex_lock(&sw->lock);
     
     /* increment port change counter */
@@ -738,7 +741,7 @@ void handle_port_status(struct switch_info *sw, struct ofp_port_status *ps) {
             
         case OFPPR_MODIFY:
             /* update existing port information */
-            int i;
+            
             for (i = 0; i < sw->num_ports; i++) {
                 if (ntohs(sw->ports[i].port_no) == ntohs(port->port_no)) {
                     memcpy(&sw->ports[i], port, sizeof(struct ofp_phy_port));
@@ -781,35 +784,249 @@ void handle_packet_in(struct switch_info *sw, struct ofp_packet_in *pi) {
     uint8_t *eth_frame = pi->data;
     uint8_t *dst_mac = eth_frame + ETH_DST_OFFSET;
     uint8_t *src_mac = eth_frame + ETH_SRC_OFFSET;
-    uint16_t eth_type = ntohs(*(uint16_t *)(eth_frame + ETH_ETHERTYPE_OFFSET));
-    
-    /* get reason for packet in */
-    const char *reason_str = "Unknown";
-    switch (pi->reason) {
-        case OFPR_NO_MATCH:
-            reason_str = "No matching flow";
-            break;
-        case OFPR_ACTION:
-            reason_str = "Action explicitly output to controller";
-            break;
-        default:
-            reason_str = "Unknown reason";
+    // uint16_t eth_type = ntohs(*(uint16_t *)(eth_frame + ETH_ETHERTYPE_OFFSET));
+
+    /* add or update source mac to mac table */
+    add_or_update_mac(src_mac, sw->datapath_id, in_port);
+
+    /*
+    log_msg("  Source MAC: %02x:%02x:%02x:%02x:%02x:%02x\n",
+            src_mac[0], src_mac[1], src_mac[2], 
+            src_mac[3], src_mac[4], src_mac[5]);
+    log_msg("  Dest MAC: %02x:%02x:%02x:%02x:%02x:%02x\n", 
+            dst_mac[0], dst_mac[1], dst_mac[2],
+            dst_mac[3], dst_mac[4], dst_mac[5]);
+    */
+
+    struct mac_entry *entry = find_mac(dst_mac);
+    if (!entry) {
+        log_msg("Destination MAC not found in table\n");
+        /* will flood packet since destination is unknown */
+        
     }
-    
-    /* log packet information */
+
+
+    /* case for OFPR_ACTION */
+
+    if (dst_mac[0] == 0x01){ /* broadcast/multicast bit set*/
+
+    } else {
+
+        /* unicast packet */
+        if (entry) { /* destination found in table so install a flow based on that */
+            
+            log_msg("Destination MAC found in table\n");
+            
+        } else { /* destination not found in table so flood similar to broadcast */
+            
+            log_msg("Destination MAC not found in table\n");
+            
+        }
+    }
+
+    /* log packet information 
     log_msg("\nPACKET_IN from switch %016" PRIx64 ":\n", sw->datapath_id);
     log_msg("  Buffer ID: %u\n", buffer_id);
     log_msg("  Total Length: %u bytes\n", total_len);
     log_msg("  In Port: %u\n", in_port);
     log_msg("  Reason: %s\n", reason_str);
-
+    */
     
     pthread_mutex_unlock(&sw->lock);
 }
 
+/* --------------------------------------------- ROUTING/FLOW INSTALLATION ----------------------------------------- */
 
+void handle_unicast_packet(struct switch_info *sw, struct ofp_packet_in *pi, struct mac_entry *dst){
 
+    /* extract data */
+    uint64_t src_dpid = sw->datapath_id;
+    uint64_t dst_dpid = dst->switch_dpid;
+    uint16_t in_port = ntohs(pi->in_port);
+    uint16_t out_port = dst->port_no;
 
+    if (src_dpid == dst_dpid){
+
+        /* install flow to self */
+        install_flow(sw, in_port, out_port, ntohl(pi->buffer_id), dst);
+        return;
+    }
+
+    /* initialize vectors to store results */
+    pthread_mutex_lock(&topology.lock);
+    igraph_integer_t src_vertex_id = VECTOR(topology.dpid_to_vertex)[src_dpid];
+    igraph_integer_t dst_vertex_id = VECTOR(topology.dpid_to_vertex)[dst_dpid];
+    pthread_mutex_unlock(&topology.lock);
+
+    /* flood packet as backup */
+    if (src_vertex_id < 0 || dst_vertex_id < 0) {
+        log_msg("Error: Can't find vertices for path calculation\n");
+    
+        /* CONSTRUCT PACKET OUT */
+
+        return;
+    }
+
+    /* calculate shortest path */
+    
+    /* init vectors for funciton call, path stored here */
+    igraph_vector_int_t vertices;
+    igraph_vector_int_t edges;
+
+    igraph_vector_init(&vertices, 0);
+    igraph_vector_init(&edges, 0);
+
+    pthread_mutex_lock(&topology.lock);
+    igraph_error_t result = igraph_get_shortest_path(&topology.graph, &vertices, &edges, src_vertex_id, dst_vertex_id, IGRAPH_OUT);
+    if(result != IGRAPH_SUCCESS) {
+        log_msg("Error: Failed to calculate shortest path\n");
+        igraph_vector_destroy(&vertices);
+        igraph_vector_destroy(&edges);
+        return;
+    }
+    pthread_mutex_unlock(&topology.lock);
+
+    /* INSTALL FLOWS FOR EACH SWITCH IN THE GRAPH */
+
+    /* clean up */
+    igraph_vector_int_destroy(&vertices);
+    igraph_vector_int_destroy(&edges);
+
+}
+
+void handle_broadcast_packet(struct switch_info *sw, struct ofp_packet_in *pi, struct mac_entry *src){
+
+    /* extract data */
+    uint64_t src_dpid = sw->datapath_id;
+    uint64_t dst_dpid = src->switch_dpid;
+    uint16_t in_port = ntohs(pi->in_port);
+    uint16_t out_port = src->port_no;
+
+    pthread_mutex_lock(&topology.lock);
+    igraph_integer_t src_vertex_id = VECTOR(topology.dpid_to_vertex)[src_dpid];
+    igraph_integer_t dst_vertex_id = VECTOR(topology.dpid_to_vertex)[dst_dpid];
+    pthread_mutex_unlock(&topology.lock);
+
+    /* init vectors for funciton call, path stored here */
+    igraph_vector_int_t res;
+    igraph_vector_init(&res, 0);
+
+    pthread_mutex_lock(&topology.lock);
+    igraph_error_t result = igraph_minimum_spanning_tree(&topology.graph, &res, IGRAPH_OUT);
+    if(result != IGRAPH_SUCCESS) {
+        log_msg("Error: Failed to calculate minimum spanning tree\n");
+        igraph_vector_destroy(&res);
+        return;
+    }
+    pthread_mutex_unlock(&topology.lock);
+
+    /* INSTALL FLOWS FOR EACH SWITCH IN THE GRAPH */
+
+    /* clean up */
+    igraph_vector_int_destroy(&res);
+
+}
+
+/* function for installing a flow to a switch once links have been discovered */
+void install_flow(struct switch_info *sw, uint16_t in_port, uint16_t dst_port, uint32_t buff_id, struct mac_entry *dst){
+    
+    int action_len = sizeof(struct ofp_action_output);
+    int total_len = sizeof(struct ofp_flow_mod) + action_len;
+
+    struct ofp_flow_mod * fm = malloc(total_len); 
+    if (!fm) {
+        log_msg("Error: Failed to allocate memory for flow_mod\n");
+        return;
+    }
+    memset(fm, 0, total_len);
+
+    /*
+    1. Create the flow_mod message
+    2. Set up the match fields (match incoming port and maybe MAC addresses)
+    3. Set up the action (forward to outgoing port)
+    4. Set appropriate timeouts and flags
+    5. Send the message to the switch
+    */
+
+    /* setup the ofp header first */
+    fm->header.version = OFP_VERSION;
+    fm->header.type = OFPT_FLOW_MOD;
+    fm->header.length = htons(total_len);
+    fm->header.xid = htonl(sw->packet_in_count++);
+
+    /* initialize the wildcards to match on in port and destinatin mac */
+    fm->match.wildcards = htonl(OFPFW_ALL & ~OFPFW_IN_PORT & ~OFPFW_DL_DST);
+    fm->match.in_port = htons(in_port);
+    memcpy(fm->match.dl_dst, dst->mac, OFP_ETH_ALEN);
+
+    fm->command = htons(OFPFC_ADD); /* new flow */
+    fm->idle_timeout = htons(60); /* 60 seconds idle timeout */
+    fm->hard_timeout = htons(300); /* 300 seconds hard timeout */
+    fm->priority = htons(OFP_DEFAULT_PRIORITY); /* default priority */
+    fm->buffer_id = htonl(buff_id);           
+    fm->flags = htons(OFPFF_SEND_FLOW_REM); /* get flow removal notifications */
+
+    /* setup the action which tells swithc to ouput a specified port for this packet */
+    struct ofp_action_output *action = (struct ofp_action_output *)fm->actions;
+    action->type = htons(OFPAT_OUTPUT);
+    action->len = htons(sizeof(struct ofp_action_output));
+    action->port = htons(dst_port);
+    action->max_len = htons(0); /* no buffer limit */
+
+    /* send the flow_mod message to the switch */
+    send_openflow_msg(sw, fm, total_len);
+
+    log_msg("Flow installed on switch %016" PRIx64 ":\n", sw->datapath_id);
+
+    free(fm);
+}
+
+/* a function for sending packet out fucntion to a swtich */
+void send_packet_out(struct switch_info *sw, uint16_t in_port, uint16_t out_port, uint32_t buff_id, uint8_t *data, size_t len){
+    
+    /* packet structure
+     * packet out -> direct instruction to switch from controller 
+     * action packet -> output packet to specific port
+     * packet data
+     * */
+
+    int action_len = sizeof(struct ofp_action_output);
+    int total_len = sizeof(struct ofp_packet_out) + action_len + len; /* will contain packet out, packet action, packet */
+    
+    struct ofp_packet_out *po = malloc(total_len);
+    if (!po) {
+        log_msg("Error: Failed to allocate memory for packet_out\n");
+        return;
+    }
+    memset(po, 0, total_len);
+
+    /* ofp header */
+    po->header.version = OFP_VERSION;
+    po->header.type = OFPT_PACKET_OUT;
+    po->header.length = htons(total_len);
+    po->header.xid = htonl(sw->packet_in_count++);
+
+    po->buffer_id = htonl(buff_id);
+    po->in_port = htons(in_port);
+    po->actions_len = htons(sizeof(struct ofp_action_output));
+
+    /* setup the action which instructs the swtich to send the 
+     * packet contained out a specific port (out_port)*/
+    struct ofp_action_output *action = (struct ofp_action_output *)po->actions; /* cast */
+    action->type = htons(OFPAT_OUTPUT); /* outut to switch port */
+    action->len = htons(sizeof(struct ofp_action_output));
+    action->port = htons(out_port);
+    action->max_len = htons(0);
+
+    /* copy the data to be sent right after the action packet */
+    memcpy((uint8_t *)po + sizeof(struct ofp_packet_out) + action_len, data, len);
+
+    send_openflow_msg(sw, po, total_len);
+
+    log_msg("Packet out sent to switch %016" PRIx64 ":\n", sw->datapath_id);
+
+    free(po);
+}
 
 
 
