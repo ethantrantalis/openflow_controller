@@ -473,7 +473,16 @@ void send_openflow_msg(struct switch_info *sw, void *msg, size_t len) {
     if (sw->active) {
         if (send(sw->socket, msg, len, 0) < 0) {      /* send to socket at switch */
             perror("Failed to send message");
+
+             /* try send again if failed */
+
+             if (send(sw->socket, msg, len, 0) < 0) {      /* send to socket at switch */
+                perror("Failed to send message again ");
+                pthread_mutex_unlock(&sw->lock);
+                return;
+            }
         }
+
     }
     pthread_mutex_unlock(&sw->lock);
 }
@@ -798,28 +807,28 @@ void handle_packet_in(struct switch_info *sw, struct ofp_packet_in *pi) {
             dst_mac[3], dst_mac[4], dst_mac[5]);
     */
 
-    struct mac_entry *entry = find_mac(dst_mac);
-    if (!entry) {
-        log_msg("Destination MAC not found in table\n");
-        /* will flood packet since destination is unknown */
-        
-    }
 
+    struct mac_entry *dst = find_mac(dst_mac);
 
     /* case for OFPR_ACTION */
 
     if (dst_mac[0] == 0x01){ /* broadcast/multicast bit set*/
+        handle_broadcast_packet(sw, pi, find_mac(src_mac));
 
     } else {
 
         /* unicast packet */
-        if (entry) { /* destination found in table so install a flow based on that */
+        if (dst) { /* destination found in table so install a flow based on that */
+            handle_unicast_packet(sw, pi, dst);
+
+            /* send the packet back to the switch that sent it */
+
             
             log_msg("Destination MAC found in table\n");
             
         } else { /* destination not found in table so flood similar to broadcast */
-            
-            log_msg("Destination MAC not found in table\n");
+
+            handle_broadcast_packet(sw, pi, find_mac(src_mac));
             
         }
     }
@@ -831,7 +840,7 @@ void handle_packet_in(struct switch_info *sw, struct ofp_packet_in *pi) {
     log_msg("  In Port: %u\n", in_port);
     log_msg("  Reason: %s\n", reason_str);
     */
-    
+
     pthread_mutex_unlock(&sw->lock);
 }
 
@@ -888,6 +897,47 @@ void handle_unicast_packet(struct switch_info *sw, struct ofp_packet_in *pi, str
 
     /* INSTALL FLOWS FOR EACH SWITCH IN THE GRAPH */
 
+    igraph_integer_t num_vertices = igraph_vector_int_size(&vertices);
+    igraph_integer_t num_edges, i = igraph_vector_int_size(&edges);
+
+    if (num_edges == 0) {
+        log_msg("No path found between switches\n");
+        return;
+    }
+
+    uint16_t dst_port, src_port = -1;
+    for (i = 0; i < num_edges; i++){
+        igraph_integer_t edge_id = VECTOR(edges)[i]; /* edges is result of finding minimum path */
+        igraph_integer_t src_vertex, dst_vertex;
+        
+
+        pthread_mutex_lock(&topology.lock);
+        igraph_edge(&topology.graph, edge_id, &src_vertex, &dst_vertex);
+
+        /* extract port info from edge */
+        igraph_integer_t src_port_from_edge = igraph_attribute_EAN(&topology.graph, "src_port", edge_id);
+        if (src_port_from_edge < 65535){
+            uint16_t src_port = (uint16_t)src_port_from_edge;
+        }
+        igraph_integer_t dst_port_from_edge = igraph_attribute_EAN(&topology.graph, "dst_port", edge_id);
+        if (dst_port_from_edge < 65535){
+            uint16_t dst_port = (uint16_t)src_port_from_edge;
+        }
+
+        pthread_mutex_unlock(&topology.lock);
+
+
+
+        /* install flow */
+        install_flow(sw, src_port, dst_port, ntohl(pi->buffer_id), dst);
+
+        /* log flow installation */
+        log_msg("Flow installed on switch %016" PRIx64 ":\n", src_dpid);
+    }
+
+    /* after all flows are installed send a packet out */
+    send_packet_out(sw, src_port, dst_port, pi->buffer_id, pi->data, ntohs(pi->total_len));
+
     /* clean up */
     igraph_vector_int_destroy(&vertices);
     igraph_vector_int_destroy(&edges);
@@ -909,7 +959,7 @@ void handle_broadcast_packet(struct switch_info *sw, struct ofp_packet_in *pi, s
 
     /* init vectors for funciton call, path stored here */
     igraph_vector_int_t res;
-    igraph_vector_init(&res, 0);
+    igraph_vector_init(&res, 0); /* vector of edge id's for minimum spanning tree*/
 
     pthread_mutex_lock(&topology.lock);
     igraph_error_t result = igraph_minimum_spanning_tree(&topology.graph, &res, IGRAPH_OUT);
@@ -920,16 +970,69 @@ void handle_broadcast_packet(struct switch_info *sw, struct ofp_packet_in *pi, s
     }
     pthread_mutex_unlock(&topology.lock);
 
-    /* INSTALL FLOWS FOR EACH SWITCH IN THE GRAPH */
+    /* get total edges from spanning tree */
+    igraph_integer_t num_edges, i = igraph_vector_int_size(&res);
+
+    /* entry for flow installation */
+    struct mac_entry *entry = malloc(sizeof(struct mac_entry));
+    if (!entry) {
+        log_msg("Error: Failed to allocate memory for mac entry\n");
+        igraph_vector_destroy(&res);
+        return;
+    }
+
+    memset(entry, 0, sizeof(struct mac_entry));
+    memset(entry->mac, 0xFF, MAC_ADDR_LEN);
+
+    /* these feilds dont really matter for this struct */
+    entry->switch_dpid = 0;
+    entry->port_no = 0;
+
+    /* iterate over all the edges from sapnning tree */
+    for (i = 0; i < num_edges; i++){
+        igraph_integer_t edge_id = VECTOR(res)[i]; /* res is result of finding minimum path */
+        igraph_integer_t src_vertex, dst_vertex;
+        uint16_t dst_port, src_port = -1;
+
+        pthread_mutex_lock(&topology.lock);
+        igraph_edge(&topology.graph, edge_id, &src_vertex, &dst_vertex);
+
+        /* extract port info from edge */
+        igraph_integer_t src_port_from_edge = igraph_attribute_EAN(&topology.graph, "src_port", edge_id);
+        if (src_port_from_edge < 65535){
+            uint16_t src_port = (uint16_t)src_port_from_edge;
+        }
+        igraph_integer_t dst_port_from_edge = igraph_attribute_EAN(&topology.graph, "dst_port", edge_id);
+        if (dst_port_from_edge < 65535){
+            uint16_t dst_port = (uint16_t)src_port_from_edge;
+        }
+
+        pthread_mutex_unlock(&topology.lock);
+
+
+
+        /* install flow */
+        install_flow(sw, src_port, dst_port, ntohl(pi->buffer_id), entry);
+
+        /* for each flow send a packet out */
+        send_packet_out(sw, src_port, dst_port, pi->buffer_id, pi->data, ntohs(pi->total_len));
+
+    }
 
     /* clean up */
     igraph_vector_int_destroy(&res);
+    free(entry);
 
 }
 
 /* function for installing a flow to a switch once links have been discovered */
 void install_flow(struct switch_info *sw, uint16_t in_port, uint16_t dst_port, uint32_t buff_id, struct mac_entry *dst){
     
+    if(dst_port < 0 || in_port < 0){
+        log_msg("Error: Invalid port number in attempeted flow install\n");
+        return;
+    }
+
     int action_len = sizeof(struct ofp_action_output);
     int total_len = sizeof(struct ofp_flow_mod) + action_len;
 
@@ -963,7 +1066,7 @@ void install_flow(struct switch_info *sw, uint16_t in_port, uint16_t dst_port, u
     fm->idle_timeout = htons(60); /* 60 seconds idle timeout */
     fm->hard_timeout = htons(300); /* 300 seconds hard timeout */
     fm->priority = htons(OFP_DEFAULT_PRIORITY); /* default priority */
-    fm->buffer_id = htonl(buff_id);           
+    fm->buffer_id = htonl(buff_id); /* buffer id */    
     fm->flags = htons(OFPFF_SEND_FLOW_REM); /* get flow removal notifications */
 
     /* setup the action which tells swithc to ouput a specified port for this packet */
@@ -993,6 +1096,8 @@ void send_packet_out(struct switch_info *sw, uint16_t in_port, uint16_t out_port
     int action_len = sizeof(struct ofp_action_output);
     int total_len = sizeof(struct ofp_packet_out) + action_len + len; /* will contain packet out, packet action, packet */
     
+    /* ADD LOGIC FOR BUFFER ID */
+
     struct ofp_packet_out *po = malloc(total_len);
     if (!po) {
         log_msg("Error: Failed to allocate memory for packet_out\n");
@@ -1027,13 +1132,3 @@ void send_packet_out(struct switch_info *sw, uint16_t in_port, uint16_t out_port
 
     free(po);
 }
-
-
-
-
-
-
-
-
-
-

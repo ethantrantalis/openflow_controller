@@ -99,7 +99,7 @@ void signal_handler(int signum);
 void log_msg(const char *format, ...);
 void cleanup_switch(struct switch_info *sw);
 
-void add_or_update_mac(uint8_t *mac, uint64_t dpid);
+void add_or_update_mac(uint8_t *mac, uint64_t dpid, uint16_t port_no);
 struct mac_entry *find_mac(uint8_t *mac);
 
 int main(int argc, char *argv[]);
@@ -135,11 +135,17 @@ void add_or_update_link(uint64_t src_dpid, uint16_t src_port, uint64_t dst_dpid,
 void add_vertex(uint64_t dpid); 
 void remove_links_for_port(uint64_t dpid, uint16_t src_port_no);
 void remove_all_switch_links(uint64_t dpid);
+uint64_t vertex_to_dpid(igraph_integer_t vertex_id);
 
 void send_topology_discovery_packet(struct switch_info *sw, uint16_t port_no);
 bool is_topology_discovery_packet(uint8_t *data, size_t len);
 bool extract_discovery_packet_info(uint8_t *data, size_t len, uint64_t *src_dpid, uint16_t *src_port);
 void handle_discovery_packet(struct switch_info *sw, struct ofp_packet_in *pi);
 
+/* flows */
+void handle_unicast_packet(struct switch_info *sw, struct ofp_packet_in *pi, struct mac_entry *dst);
+void handle_broadcast_packet(struct switch_info *sw, struct ofp_packet_in *pi, struct mac_entry *src);
+void install_flow(struct switch_info *sw, uint16_t in_port, uint16_t dst_port, uint32_t buff_id, struct mac_entry *dst);
+void send_packet_out(struct switch_info *sw, uint16_t in_port, uint16_t out_port, uint32_t buff_id, uint8_t *data, size_t len);
 
 #endif

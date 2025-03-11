@@ -36,6 +36,7 @@ void init_topology(){
     /* initialize the graph */
     igraph_empty(&topology.graph, 0, IGRAPH_UNDIRECTED);
     igraph_vector_init(&topology.dpid_to_vertex, 0); /* mapping of dpid to vertex id */
+    igraph_vector_fill(&topology.dpid_to_vertex, -1); /* fill with -1 to indicate not found */
 
 
     igraph_set_attribute_table(&igraph_cattribute_table);
@@ -128,6 +129,8 @@ void add_vertex(uint64_t dpid){
     }
 
     /* set the value */
+
+    
     VECTOR(topology.dpid_to_vertex)[dpid] = vertex_id;
 
     pthread_mutex_unlock(&topology.lock);
@@ -160,6 +163,8 @@ void add_or_update_link(uint64_t src_dpid, uint16_t src_port, uint64_t dst_dpid,
     }
     
     /* set or update edge attributes */
+    igraph_cattribute_EAN_set(&topology.graph, "src_dpid", edge_id, src_dpid);
+    igraph_cattribute_EAN_set(&topology.graph, "dst_dpid", edge_id, dst_dpid);
     igraph_cattribute_EAN_set(&topology.graph, "src_port", edge_id, src_port);
     igraph_cattribute_EAN_set(&topology.graph, "dst_port", edge_id, dst_port);
     igraph_cattribute_EAN_set(&topology.graph, "last_seen", edge_id, time(NULL));
@@ -369,6 +374,29 @@ void handle_discovery_packet(struct switch_info *sw, struct ofp_packet_in *pi) {
     
     /* update topology with this link information */
     add_or_update_link(src_dpid, src_port, dst_dpid, dst_port);
+}
+
+uint64_t vertex_to_dpid(igraph_integer_t vertex_id) {
+    pthread_mutex_lock(&topology.lock);
+
+    /* size will be for iterating over vertices */
+    igraph_integer_t size, i = igraph_vcount(&topology.graph);
+    if (vertex_id < 0 || vertex_id >= size) {
+        pthread_mutex_unlock(&topology.lock);
+        return -1;
+    }
+
+    /* remember that for the vector the index is dpid and value is vertex*/
+    for (i = 0; i < size; i++){
+
+        if (VECTOR(topology.dpid_to_vertex)[i] == vertex_id) {
+            pthread_mutex_unlock(&topology.lock);
+            return i;
+        }
+    }
+    
+    pthread_mutex_unlock(&topology.lock);
+    return -1;
 }
 
 /* 
