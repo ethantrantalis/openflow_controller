@@ -80,11 +80,16 @@ struct mac_entry {
     UT_hash_handle hh; /* makes this structure hashable */
 }; 
 
+struct dpid_to_vertex_map {
+    uint64_t dpid;
+    igraph_integer_t vertex_id;
+    UT_hash_handle hh;
+};
+
 struct network_topology {
     igraph_t graph;                /* iGraph object representing the network */
     pthread_mutex_t lock;          /* lock for thread safety */
     
-    igraph_vector_t dpid_to_vertex;  /* map datapath IDs to vertex IDs */
 };
 
 /* global variables */
@@ -93,6 +98,7 @@ extern pthread_mutex_t switches_lock;
 extern int server_socket;
 extern volatile int running; /* for controller clean up and running */
 extern struct network_topology topology;
+extern struct dpid_to_vertex_map * dpids_to_vertex;
 
 /* function prototypes */
 void signal_handler(int signum); 
@@ -101,6 +107,11 @@ void cleanup_switch(struct switch_info *sw);
 
 void add_or_update_mac(uint8_t *mac, uint64_t dpid, uint16_t port_no);
 struct mac_entry *find_mac(uint8_t *mac);
+
+void add_or_update_dpid(uint64_t dpid, igraph_integer_t vertex_id);
+bool dpid_exists(uint64_t dpid);
+igraph_integer_t find_vertexid(uint64_t dpid);
+void delete_dpid_mapping(uint64_t dpid);
 
 int main(int argc, char *argv[]);
 void init_controller(int port); 

@@ -28,16 +28,61 @@
     #define htobe64(x) OSSwapHostToBigInt64(x)
 #endif
 
+
+
+struct dpid_to_vertex_map * dpids_to_vertex = NULL;
+
+void add_or_update_dpid(uint64_t dpid, igraph_integer_t vertex_id) {
+    struct dpid_to_vertex_map *entry;
+    
+    // Use &dpid to pass a pointer to the key
+    HASH_FIND(hh, dpids_to_vertex, &dpid, sizeof(uint64_t), entry);
+    if (entry == NULL) {
+        entry = malloc(sizeof(struct dpid_to_vertex_map));
+        entry->dpid = dpid;
+        entry->vertex_id = vertex_id;
+        HASH_ADD(hh, dpids_to_vertex, dpid, sizeof(uint64_t), entry);
+    } else {
+        // Update existing entry
+        entry->vertex_id = vertex_id;
+    }
+}
+
+bool dpid_exists(uint64_t dpid) {
+    struct dpid_to_vertex_map *entry;
+    // Need to pass a pointer to the dpid value, not the value itself
+    HASH_FIND(hh, dpids_to_vertex, &dpid, sizeof(uint64_t), entry);
+    return entry != NULL;
+}
+
+igraph_integer_t find_vertexid(uint64_t dpid) {
+    struct dpid_to_vertex_map *entry;
+    HASH_FIND(hh, dpids_to_vertex, &dpid, sizeof(uint64_t), entry);
+    return entry->vertex_id;
+}
+
+void delete_dpid_mapping(uint64_t dpid) {
+    struct dpid_to_vertex_map *entry;
+    
+    // Find the entry with the given dpid
+    HASH_FIND(hh, dpids_to_vertex, &dpid, sizeof(uint64_t), entry);
+    
+    // If the entry exists, remove it from the hash and free memory
+    if (entry != NULL) {
+        HASH_DEL(dpids_to_vertex, entry);
+        free(entry);
+    }
+}
+
 void init_topology(){
+
+    printf("Initializing topology\n");
 
     /* initialize the mutex */
     pthread_mutex_init(&topology.lock, NULL);
 
     /* initialize the graph */
     igraph_empty(&topology.graph, 0, IGRAPH_UNDIRECTED);
-    igraph_vector_init(&topology.dpid_to_vertex, 0); /* mapping of dpid to vertex id */
-    igraph_vector_fill(&topology.dpid_to_vertex, -1); /* fill with -1 to indicate not found */
-
 
     igraph_set_attribute_table(&igraph_cattribute_table);
 
@@ -47,15 +92,29 @@ void init_topology(){
 
 /* funciton to handle a switch joining the graph, explore all connections */
 void handle_switch_join(struct switch_info *sw) {
+    printf("Handling switch join\n");
     pthread_mutex_lock(&topology.lock);
     
     /* add switch to topology if not exists */
-    igraph_integer_t vertex_id = VECTOR(topology.dpid_to_vertex)[sw->datapath_id];
 
-    if (vertex_id < 0) { /* does not exist in the topology yet */
+
+    igraph_integer_t vertex_id = -1;
+
+    if(dpid_exists(sw->datapath_id)){
+        printf("Switch already exists in topology\n");
+        vertex_id = find_vertexid(sw->datapath_id);
+
+    } else {
+        printf("Switch does not exist in topology\n");
+
         add_vertex(sw->datapath_id);
-        
+
+        /* the newest vertex id will be the length of the vertex vector minus 1*/
+        igraph_integer_t new_vertex_id = igraph_vcount(&topology.graph) - 1;
+        add_or_update_dpid(sw->datapath_id, new_vertex_id);
     }
+    printf("Vertex id: %lld\n", vertex_id);
+
     
     pthread_mutex_unlock(&topology.lock);
     
@@ -76,12 +135,12 @@ void handle_switch_disconnect(struct switch_info *sw) {
     /* remove all links associated with this switch */
     remove_all_switch_links(sw->datapath_id);
     
-    igraph_integer_t vertex_id = VECTOR(topology.dpid_to_vertex)[sw->datapath_id];
+    igraph_integer_t vertex_id = find_vertexid(sw->datapath_id);
 
     if (vertex_id >= 0) { /* found */
         /* remove the vertex */
         igraph_delete_vertices(&topology.graph, igraph_vss_1(vertex_id));
-        VECTOR(topology.dpid_to_vertex)[sw->datapath_id] = -1; /* mark as not found in case looked up later */
+        delete_dpid_mapping(sw->datapath_id); /* mark as not found in case looked up later */
     }
     
     pthread_mutex_unlock(&topology.lock);
@@ -105,33 +164,37 @@ void handle_port_change(struct switch_info *sw, uint16_t src_port_no, bool is_up
 /* ----------------------------------------- TOPOLOGY MODIFICATION HELPERS ----------------------------------------- */
 
 /* a function to easily add a vertex to the graph and update the vtex -> dpid vector */
-void add_vertex(uint64_t dpid){
+void add_vertex(uint64_t dpid) {
+    printf("Adding vertex for switch %016" PRIx64 "\n", dpid);
     
     pthread_mutex_lock(&topology.lock);
 
-    igraph_integer_t vertex_id;
+    // First check if vertex already exists (important!)
+    if(dpid_exists(dpid)){
+        printf("Vertex already exists in topology\n");
+        pthread_mutex_unlock(&topology.lock);
+        return;
+    } 
 
-    igraph_add_vertices(&topology.graph, 1, NULL); /* add one vertex */
-    vertex_id = igraph_vcount(&topology.graph) - 1; /* the newest vertex will be the hightest counted id */
+    // Add new vertex - this creates a new UNIQUE vertex ID
+    printf("Before adding vertex: graph has %lld vertices\n", igraph_vcount(&topology.graph));
+    igraph_add_vertices(&topology.graph, 1, NULL);
+    printf("After adding vertex: graph has %lld vertices\n", igraph_vcount(&topology.graph));
+    igraph_integer_t vertex_id = igraph_vcount(&topology.graph) - 1;
     
-    /* set attributes */
-    char dpid_str[20];  /* buffer for the string representation */
+    // Print information for debugging
+    printf("Created vertex ID %lld for switch %016" PRIx64 "\n", vertex_id, dpid);
+    
+    // Set attributes
+    char dpid_str[20];
     snprintf(dpid_str, sizeof(dpid_str), "%" PRIu64, dpid);
     igraph_cattribute_VAS_set(&topology.graph, "dpid", vertex_id, dpid_str);
     
-    /* map the dpid to the map of dpid to vector id 
-    * the vector index is the dpid and the value at that
-    * inedex is vertex id */
+    // Add to the dpid -> vertex map
+    add_or_update_dpid(dpid, vertex_id);
     
-    /* resize if too small */
-    if (dpid >= igraph_vector_size(&topology.dpid_to_vertex)) {
-        igraph_vector_resize(&topology.dpid_to_vertex, dpid + 1);
-    }
-
-    /* set the value */
-
     
-    VECTOR(topology.dpid_to_vertex)[dpid] = vertex_id;
+    
 
     pthread_mutex_unlock(&topology.lock);
 }
@@ -140,21 +203,24 @@ void add_vertex(uint64_t dpid){
 /* add or update a link in the topology */
 void add_or_update_link(uint64_t src_dpid, uint16_t src_port, uint64_t dst_dpid, uint16_t dst_port) {
 
+    printf("Adding or updating link\n");
+
     pthread_mutex_lock(&topology.lock);
     /* find or add source and destination vertices */
      
-    igraph_integer_t src_vertex = VECTOR(topology.dpid_to_vertex)[src_dpid];
-    igraph_integer_t dst_vertex = VECTOR(topology.dpid_to_vertex)[dst_dpid];
+    igraph_integer_t src_vertex = find_vertexid(src_dpid);
+    igraph_integer_t dst_vertex = find_vertexid(dst_dpid);
 
     if (src_vertex < 0 || dst_vertex < 0) {
-        log_msg("Failed to find vertex in Vector\n");
+        printf("Failed to find vertex in Vector\n");
         pthread_mutex_unlock(&topology.lock);
         return;
     }
     
     /* check if edge already exists */
+    printf("Getting edge id\n");
     igraph_integer_t edge_id;
-    igraph_get_eid(&topology.graph, &edge_id, src_vertex, dst_vertex, IGRAPH_DIRECTED, 0);
+    igraph_get_eid(&topology.graph, &edge_id, src_vertex, dst_vertex, IGRAPH_UNDIRECTED, 0);
     
     if (edge_id < 0) { /* edge not found */
         /* add new edge */
@@ -177,9 +243,10 @@ void remove_links_for_port(uint64_t dpid, uint16_t src_port_no){
 
     pthread_mutex_lock(&topology.lock);
 
-    igraph_integer_t vertex = VECTOR(topology.dpid_to_vertex)[dpid];
+    igraph_integer_t vertex = find_vertexid(dpid);
+    printf("igraph vertex: %lld\n", vertex);
     if (vertex < 0) {
-        log_msg("Failed to find vertex in Vector\n");
+        printf("Failed to find vertex in Vector\n");
         return; /* vertex not found */
     }
 
@@ -259,9 +326,9 @@ void send_topology_discovery_packet(struct switch_info *sw, uint16_t port_no) {
     memcpy(disc_packet + packet_size, src_mac, MAC_ADDR_LEN);
     packet_size += 6; /* increment the size for offsets */
     
-    /* set EtherType to commone LLDP type (0x88CC) */
+    /* set EtherType to custom type (0x88CC) */
     disc_packet[packet_size++] = 0x88;
-    disc_packet[packet_size++] = 0xCC;
+    disc_packet[packet_size++] = 0xBA;  
     
 
     /* start of custom packet structure */
@@ -295,7 +362,7 @@ void send_topology_discovery_packet(struct switch_info *sw, uint16_t port_no) {
     int total_len = sizeof(struct ofp_packet_out) + sizeof(action) + packet_size;
     struct ofp_packet_out *po = malloc(total_len);
     if (!po) {
-        log_msg("Error: Failed to allocate memory for packet_out message\n");
+        printf("Error: Failed to allocate memory for packet_out message\n");
         return;
     }
     
@@ -315,7 +382,7 @@ void send_topology_discovery_packet(struct switch_info *sw, uint16_t port_no) {
     
     send_openflow_msg(sw, po, total_len);
     
-    log_msg("Sent discovery packet from switch %016" PRIx64 " port %d\n", 
+    printf("Sent discovery packet from switch %016" PRIx64 " port %d\n", 
             sw->datapath_id, port_no);
     
     free(po);
@@ -323,18 +390,42 @@ void send_topology_discovery_packet(struct switch_info *sw, uint16_t port_no) {
 
 /* helper function to verify that a packet is link layer discovery */
 bool is_topology_discovery_packet(uint8_t *data, size_t len) {
-    if (len < 26) return false;
-    
-    /* check destination MAC is the multicast address */
-    uint8_t expected_dst_mac[MAC_ADDR_LEN] = {0x01, 0x80, 0xC2, 0x00, 0x00, 0x0E}; 
-    if (memcmp(data, expected_dst_mac, MAC_ADDR_LEN) != 0) return false; /* lldp multicast is ethernet dst */
-    
+    // printf("Entering check for topology discovery packet\n");
+    if (len < 26){
+        printf("Packet too short\n");
+        return false;
+    }
+
     /* check EtherType */
-    if (data[LLDP_ETHERTYPE_OFFSET] != 0x88 || data[LLDP_ETHERTYPE_OFFSET + 1] != 0xCC) return false; /* should be right after dst mac and src mac */
+    if (data[LLDP_ETHERTYPE_OFFSET] != 0x88 || data[LLDP_ETHERTYPE_OFFSET + 1] != 0xBA){
+        printf("EtherType: %02x%02x\n", data[LLDP_ETHERTYPE_OFFSET], data[LLDP_ETHERTYPE_OFFSET + 1]);
+        return false;
+    }  /* should be right after dst mac and src mac */
+    // printf("EtherType correct: %02x%02x\n", data[LLDP_ETHERTYPE_OFFSET], data[LLDP_ETHERTYPE_OFFSET + 1]);
     
     /* check magic number */
     uint32_t magic;
     memcpy(&magic, data + LLDP_MAGIC_OFFSET, 4); /* 14 is dst mac (6) + src mac (6) + type (2) */
+    // printf("Magic found: 0x%08x\n", ntohl(magic));
+    
+    /* check destination MAC is the multicast address */
+    uint8_t expected_dst_mac[MAC_ADDR_LEN] = {0x01, 0x80, 0xC2, 0x00, 0x00, 0x0E}; 
+    if (memcmp(data, expected_dst_mac, MAC_ADDR_LEN) != 0){
+        printf("Dest MAC not multicast: %02x:%02x:%02x:%02x:%02x:%02x\n", 
+            data[0], data[1], data[2], data[3], data[4], data[5]);
+
+        return false;
+    } /* lldp multicast is ethernet dst */
+    
+    
+
+    /*
+    printf("Dest MAC: %02x:%02x:%02x:%02x:%02x:%02x\n", 
+        data[0], data[1], data[2], data[3], data[4], data[5]);
+    printf("EtherType: %02x%02x\n", data[12], data[13]);
+
+    printf("Magic: 0x%08x (expected 0x4F46544F)\n", ntohl(magic));
+    */
     return ntohl(magic) == 0x4F46544F; /* "OFTO" */
 }
 
@@ -358,21 +449,25 @@ bool extract_discovery_packet_info(uint8_t *data, size_t len, uint64_t *src_dpid
 }
 
 void handle_discovery_packet(struct switch_info *sw, struct ofp_packet_in *pi) {
+    printf("Handling discovery packet for switch %016" PRIx64 "\n", sw->datapath_id);
     uint64_t src_dpid;
     uint16_t src_port;
     uint64_t dst_dpid = sw->datapath_id;
     uint16_t dst_port = ntohs(pi->in_port);
+
+    
     
     /* extract information from discovery packet, passed reference items */
     if (!extract_discovery_packet_info(pi->data, ntohs(pi->total_len), &src_dpid, &src_port)) {
-        log_msg("Failed to extract information from discovery packet\n");
+        printf("Failed to extract information from discovery packet\n");
         return;
     }
     
-    log_msg("Received discovery packet: Switch %016" PRIx64 " Port %d -> Switch %016" PRIx64 " Port %d\n",
+    printf("Received discovery packet: Switch %016" PRIx64 " Port %d -> Switch %016" PRIx64 " Port %d\n",
             src_dpid, src_port, dst_dpid, dst_port);
     
     /* update topology with this link information */
+    printf("Adding link to topology\n");
     add_or_update_link(src_dpid, src_port, dst_dpid, dst_port);
 }
 
@@ -380,16 +475,17 @@ uint64_t vertex_to_dpid(igraph_integer_t vertex_id) {
     pthread_mutex_lock(&topology.lock);
 
     /* size will be for iterating over vertices */
-    igraph_integer_t size, i = igraph_vcount(&topology.graph);
+    igraph_integer_t size = igraph_vcount(&topology.graph);
+    igraph_integer_t i;
     if (vertex_id < 0 || vertex_id >= size) {
         pthread_mutex_unlock(&topology.lock);
         return -1;
     }
 
-    /* remember that for the vector the index is dpid and value is vertex*/
+
     for (i = 0; i < size; i++){
 
-        if (VECTOR(topology.dpid_to_vertex)[i] == vertex_id) {
+        if (find_vertexid(i) == vertex_id) {
             pthread_mutex_unlock(&topology.lock);
             return i;
         }
