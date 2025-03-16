@@ -80,6 +80,8 @@
 #include "headers/controller.h"
 #include "headers/openflow.h"
 
+#define MAX_PORTS_PER_SWITCH 256
+
 #define DEF_PORT 6653
 
 /* global variables */
@@ -100,6 +102,12 @@ void add_or_update_mac(uint8_t *mac, uint64_t dpid, uint16_t port_no) {
         entry = malloc(sizeof(struct mac_entry));
         memcpy(entry->mac, mac, MAC_ADDR_LEN);
         HASH_ADD(hh, mac_table, mac, MAC_ADDR_LEN, entry);
+        printf("DEBUG: Added new MAC %02x:%02x:%02x:%02x:%02x:%02x to table for switch %016" PRIx64 " port %d\n",
+               mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], dpid, port_no);
+    }else {
+        printf("DEBUG: Updated MAC %02x:%02x:%02x:%02x:%02x:%02x from switch %016" PRIx64 " port %d to switch %016" PRIx64 " port %d\n",
+               mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], 
+               entry->switch_dpid, entry->port_no, dpid, port_no);
     }
     
     /* add other values of update values if already exists */
@@ -112,6 +120,15 @@ void add_or_update_mac(uint8_t *mac, uint64_t dpid, uint16_t port_no) {
 struct mac_entry *find_mac(uint8_t *mac) {
     struct mac_entry *entry;
     HASH_FIND(hh, mac_table, mac, MAC_ADDR_LEN, entry);
+    printf("DEBUG: MAC lookup for %02x:%02x:%02x:%02x:%02x:%02x: %s\n",
+           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+           entry ? "Found" : "Not found");
+
+    if (entry) {
+        printf("DEBUG: MAC %02x:%02x:%02x:%02x:%02x:%02x is on switch %016" PRIx64 " port %d\n",
+               mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], 
+               entry->switch_dpid, entry->port_no);
+    }
     return entry;
 }
 
@@ -124,7 +141,7 @@ void signal_handler(int signum) {
 }
 
 /* thread-safe logging function */
-void log_msg(const char *format, ...) {
+void log_msg(struct switch_info * sw, const char *format, ...) {
     va_list args;
     va_start(args, format);
     
@@ -141,6 +158,10 @@ void log_msg(const char *format, ...) {
            tm_info->tm_min, 
            tm_info->tm_sec,
            (long)tv.tv_usec);
+
+    if (sw) {
+        printf("> Switch %016" PRIx64 ": ", sw->datapath_id);
+    }
     
     vprintf(format, args);
     fflush(stdout);
@@ -166,6 +187,17 @@ void cleanup_switch(struct switch_info *sw) {
         sw->features_received = 0;
     }
     pthread_mutex_unlock(&sw->lock);
+
+    pthread_mutex_lock(&switches_lock);
+    int i;
+    for (i = 0; i < MAX_SWITCHES; i++) {
+        if (&switches[i] == sw) {
+            pthread_mutex_lock(&switches[i].lock);
+            switches[i].active = 0;
+            pthread_mutex_unlock(&switches[i].lock);
+            break;
+        }
+    }
 }
 
 /* main controller function */
@@ -246,7 +278,7 @@ void init_controller(int port) {
         exit(1);
     }
 
-    printf("Socket created\n");
+    printf("Controller socket created\n");
     
     /* set socket options */
     
@@ -299,6 +331,7 @@ void *accept_handler(void *arg) {
 
         /* accept new connection from the socket created in init_controller */
         int client = accept(server_socket, (struct sockaddr *)&addr, &addr_len);
+        
         if (client < 0) {
             if (errno == EINTR && !running) {
                 printf("Accept interrupted by shutdown\n");
@@ -310,6 +343,42 @@ void *accept_handler(void *arg) {
         
         printf("New connection accepted from %s:%d\n", 
                inet_ntoa(addr.sin_addr), ntohs(addr.sin_port));
+
+        /* Configure TCP socket options for robustness */
+        int flag = 1;
+        if (setsockopt(client, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(int)) < 0) {
+            perror("Failed to set TCP_NODELAY");
+        }
+        
+        if (setsockopt(client, SOL_SOCKET, SO_KEEPALIVE, &flag, sizeof(int)) < 0) {
+            perror("Failed to set SO_KEEPALIVE");
+        }
+        
+        #ifdef __linux__
+        /* Linux-specific keepalive parameters */
+        int idle = 10;  /* Start sending keepalive probes after 10 seconds of idle */
+        if (setsockopt(client, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(int)) < 0) {
+            perror("Failed to set TCP_KEEPIDLE");
+        }
+        
+        int interval = 5;  /* Send keepalive probes every 5 seconds */
+        if (setsockopt(client, IPPROTO_TCP, TCP_KEEPINTVL, &interval, sizeof(int)) < 0) {
+            perror("Failed to set TCP_KEEPINTVL");
+        }
+        
+        int count = 3;  /* Consider connection dead after 3 failed probes */
+        if (setsockopt(client, IPPROTO_TCP, TCP_KEEPCNT, &count, sizeof(int)) < 0) {
+            perror("Failed to set TCP_KEEPCNT");
+        }
+        #endif
+        
+        #ifdef __APPLE__
+        /* macOS has different keepalive settings */
+        /* macOS uses system-wide settings by default */
+        /* You can use sysctl to check/change system-wide settings */
+        printf("TCP keepalive enabled (using system defaults for macOS)\n");
+        #endif
+        
 
         /* find free switch slot */
         printf("Finding free switch slot\n");
@@ -354,6 +423,8 @@ void *switch_handler(void *arg) {
     ssize_t len;
     time_t next_echo = 0;
     time_t now;
+
+    time_t connection_start = time(NULL);
     
     printf("Switch handler started for new connection\n");
     
@@ -391,7 +462,10 @@ void *switch_handler(void *arg) {
             }
             
             if (sw->echo_pending && (now - sw->last_echo) > ECHO_TIMEOUT) {
+                log_msg(sw, "Connection to switch timed out\n");
                 sw->echo_pending = false;
+                cleanup_switch(sw); /* clean up now that connection ended */
+                log_msg(sw,"Switch cleaned, exiting...\n");
                 return NULL; /* connection endded */
             }
             
@@ -408,18 +482,16 @@ void *switch_handler(void *arg) {
         if (ret > 0 && FD_ISSET(sw->socket, &readfds)) {
             len = recv(sw->socket, buf, sizeof(buf), 0);
             if (len == 0) {
-                printf("Connection closed cleanly by switch %016" PRIx64 "\n", 
-                       sw->datapath_id);
+                log_msg(sw, "DEBUG: Connection closed cleanly after %ld seconds uptime\n", time(NULL) - connection_start);
                 break;
             } else if (len < 0) {
                 if (errno == EINTR) {
+                    log_msg(sw, "ERROR: Connection error after %ld seconds uptime\n",  time(NULL) - connection_start);
                     continue;
                 } else if (errno == ECONNRESET) {
-                    printf("Connection reset by switch %016" PRIx64 "\n", 
-                           sw->datapath_id);
+                    log_msg(sw, "ERROR: Connection reset by switch\n");
                 } else {
-                    printf("Receive error on switch %016" PRIx64 ": %s\n",
-                           sw->datapath_id, strerror(errno));
+                    log_msg(sw, "ERROR: Receive error on switch: %s\n", sw->datapath_id, strerror(errno));
                 }
                 break;
             }
@@ -429,7 +501,7 @@ void *switch_handler(void *arg) {
         }
     }
 
-    printf("cleaning switch\n");
+    log_msg(sw, "Cleaning switch\n");
     cleanup_switch(sw);
     
     printf("Switch handler exiting\n");
@@ -474,9 +546,31 @@ void handle_switch_message(struct switch_info *sw, uint8_t *msg, size_t len) {
         case OFPT_PORT_STATUS:
             handle_port_status(sw, (struct ofp_port_status *)msg);
             break;
+
+        case OFPT_ERROR:
+            {
+                struct ofp_error_msg *err = (struct ofp_error_msg *)msg;
+                log_msg(sw, "ERROR: Received OpenFlow error from switch: type=%d, code=%d\n", ntohs(err->type), ntohs(err->code));
+                
+                if (ntohs(err->type) == OFPET_FLOW_MOD_FAILED) {
+                    log_msg(sw, "ERROR: Flow modification failed: ");
+                    switch(ntohs(err->code)) {
+                        case OFPFMFC_ALL_TABLES_FULL:
+                            printf("\tAll tables full\n");
+                            break;
+                        case OFPFMFC_OVERLAP:
+                            printf("\tOverlapping entry\n");
+                            break;
+                        
+                        default:
+                            printf("\tUnknown code: %d\n", ntohs(err->code));
+                    }
+                }
+            }
+            break;
             
         default:
-            printf("Unhandled message type: %d\n", oh->type);
+            log_msg(sw, "ERROR: Unhandled message type: %d\n", oh->type);
     }
 }
 
@@ -486,12 +580,12 @@ void send_openflow_msg(struct switch_info *sw, void *msg, size_t len) {
     pthread_mutex_lock(&sw->lock);      /* lock threads for safety */
     if (sw->active) {
         if (send(sw->socket, msg, len, 0) < 0) {      /* send to socket at switch */
-            perror("Failed to send message");
+            log_msg(sw, "ERROR: Failed to send openflow message: %s\n", strerror(errno));
 
              /* try send again if failed */
 
              if (send(sw->socket, msg, len, 0) < 0) {      /* send to socket at switch */
-                perror("Failed to send message again ");
+                log_msg(sw, "ERROR: Failed to send openflow message again: %s\n", strerror(errno));
                 pthread_mutex_unlock(&sw->lock);
                 return;
             }
@@ -515,14 +609,14 @@ void send_hello(struct switch_info *sw) {
     /* use OpenFlow hello packet */
     send_openflow_msg(sw, &hello, sizeof(hello));
 
-    printf("Sent HELLO to switch %016" PRIx64 "\n", sw->datapath_id);
+    log_msg(sw, "Sent HELLO to switch\n");
 }
 
 /* handle HELLO message */
 void handle_hello(struct switch_info *sw, struct ofp_header *oh) {
     sw->version = oh->version;
     sw->hello_received = 1;  /* mark HELLO as received */
-    printf("Switch hello received, version 0x%02x\n", sw->version);
+    log_msg(sw, "Switch hello received, version 0x%02x\n", sw->version);
     
     /* only send features request after HELLO exchange is complete */
     if (sw->version == OFP_VERSION) {
@@ -546,7 +640,7 @@ void handle_hello(struct switch_info *sw, struct ofp_header *oh) {
 /* send features request */
 void send_features_request(struct switch_info *sw) {
 
-    printf("Sending features request.\n");
+    log_msg(sw, "Sending features request.\n");
     struct ofp_header freq;
     
     freq.version = OFP_VERSION;
@@ -575,14 +669,14 @@ void handle_features_reply(struct switch_info *sw, struct ofp_switch_features *f
         sw->num_ports = num_ports;
     }
     
-    printf("\nSwitch features:\n");
-    printf("  Datapath ID: %016" PRIx64 "\n", sw->datapath_id);
+    log_msg(sw, "Switch features:\n");
+    log_msg(sw, "  Datapath ID: %016" PRIx64 "\n", sw->datapath_id);
     /*
     printf("  OpenFlow version: 0x%02x\n", sw->version);
     printf("  Number of tables: %d\n", sw->n_tables);
     printf("  Number of buffers: %d\n", ntohl(features->n_buffers));
     */
-    printf("  Number of ports: %d\n", num_ports);
+    log_msg(sw, "  Number of ports: %d\n", num_ports);
     
     /* print capabilities for debugging purposes */
     /*
@@ -636,7 +730,7 @@ void handle_features_reply(struct switch_info *sw, struct ofp_switch_features *f
     /* add switch to topology */
     
     handle_switch_join(sw);
-    printf("Added switch to topolgy\n");
+    log_msg(sw, "Added switch to topolgy\n");
 }
 
 /* ------------------------------------------------------- ECHO ---------------------------------------------------- */
@@ -663,14 +757,13 @@ bool send_echo_request(struct switch_info *sw) {
                 sw->echo_pending = false;  /* reset if send failed */
             }
 
-            printf("Echo request sent to switch %016" PRIx64 " (XID: %u)\n", 
-                    sw->datapath_id, ntohl(echo.xid));
+            log_msg(sw, "Echo request sent to switch (XID: %u)\n", sw->datapath_id, ntohl(echo.xid));
         }
         pthread_mutex_unlock(&sw->lock);
         
         return success;
     }
-    printf("Echo request already pending for switch %016" PRIx64 "\n", sw->datapath_id);
+    log_msg(sw, "Echo request already pending for switch \n");
     return false;
 }
 
@@ -683,8 +776,7 @@ void handle_echo_reply(struct switch_info *sw, struct ofp_header *oh) {
     sw->echo_pending = false;  /* Mark that anothe echo can be send, meaning echos have vbeen recienved */
 
     /* for debugging */
-    printf("Echo reply received from switch %016" PRIx64 " (XID: %u)\n", 
-            sw->datapath_id, ntohl(oh->xid));
+    log_msg(sw, "Echo reply received from switch (XID: %u)\n", ntohl(oh->xid));
     
     pthread_mutex_unlock(&sw->lock);
 }
@@ -705,7 +797,7 @@ void handle_echo_request(struct switch_info *sw, struct ofp_header *oh) {
 /* handle port status changes */
 void handle_port_status(struct switch_info *sw, struct ofp_port_status *ps) {
     if (!ps) {
-        printf("Error: Null port_status message\n");
+        log_msg(sw, "ERROR: Null port_status message\n");
         return;
     }
 
@@ -731,30 +823,30 @@ void handle_port_status(struct switch_info *sw, struct ofp_port_status *ps) {
         case OFPPR_ADD:
             reason_str = "PORT ADDED";
             handle_port_change(sw, ntohs(port->port_no), true);
-            printf("Port %hu added for switch %016" PRIx64 "\n",port->port_no, sw->datapath_id);
+            log_msg(sw, "Port %hu added for switch\n",port->port_no);
             break;
         case OFPPR_DELETE:
             reason_str = "PORT REMOVED";
             handle_port_change(sw, ntohs(port->port_no), false);
-            printf("Port %hu removed for switch %016" PRIx64 "\n",port->port_no, sw->datapath_id);
+            log_msg(sw, "Port %hu removed for switch\n",port->port_no);
             break;
         case OFPPR_MODIFY:
 
             /* the handle discovery packet function handles both adding and updateding connections */
             reason_str = "PORT MODIFIED";
             handle_port_change(sw, ntohs(port->port_no), true);
-            printf("Port %hu modified for switch %016" PRIx64 "\n",port->port_no, sw->datapath_id);
+            log_msg(sw, "Port %hu modified for switch \n",port->port_no);
             break;
         default:
             reason_str = "UNKNOWN";
     }
     
     /* log the port status change */
-    printf("\nPort status change on switch %016" PRIx64 ":\n", sw->datapath_id);
-    printf("  Port: %u (%s)\n", ntohs(port->port_no), port->name);
-    printf("  Reason: %s\n", reason_str);
-    printf("  State: %s\n", state_str);
-    printf("  Hardware Addr: %02x:%02x:%02x:%02x:%02x:%02x\n",
+    log_msg(sw, "\nPort status change on switch:\n");
+    log_msg(sw, "  Port: %u (%s)\n", ntohs(port->port_no), port->name);
+    log_msg(sw, "  Reason: %s\n", reason_str);
+    log_msg(sw, "  State: %s\n", state_str);
+    log_msg(sw, "  Hardware Addr: %02x:%02x:%02x:%02x:%02x:%02x\n",
             port->hw_addr[0], port->hw_addr[1], port->hw_addr[2],
             port->hw_addr[3], port->hw_addr[4], port->hw_addr[5]);
     
@@ -764,11 +856,11 @@ void handle_port_status(struct switch_info *sw, struct ofp_port_status *ps) {
 /* handle incoming packets from the switch */
 void handle_packet_in(struct switch_info *sw, struct ofp_packet_in *pi) {
     if (!pi) {
-        printf("Error: Null packet_in message\n");
+        log_msg(sw, "ERROR: Null packet_in message\n");
         return;
     }
 
-    printf("Packet in details: reason=%d, port=%d, buffer_id=%u, data_len=%u\n", 
+    log_msg(sw, "Packet in details: reason=%d, port=%d, buffer_id=%u, data_len=%u\n", 
        pi->reason, ntohs(pi->in_port), ntohl(pi->buffer_id), ntohs(pi->total_len));
 
     /* lock switch for thread safety while accessing switch info */
@@ -778,10 +870,10 @@ void handle_packet_in(struct switch_info *sw, struct ofp_packet_in *pi) {
     sw->packet_in_count++;
 
     /* first check if its a topology discovery packet */
-    printf("Checking for topology discovery packet\n");
+    log_msg(sw, "Checking for topology discovery packet\n");
     if(is_topology_discovery_packet(pi->data, ntohs(pi->total_len))) {
         handle_discovery_packet(sw, pi);
-        printf("Topology discovery packet received from switch %016" PRIx64 "\n", sw->datapath_id);
+        log_msg(sw, "Topology discovery packet received from switch \n");
         pthread_mutex_unlock(&sw->lock);
         return; /* return succesfully */
     }
@@ -789,13 +881,17 @@ void handle_packet_in(struct switch_info *sw, struct ofp_packet_in *pi) {
     /* extract basic packet information */
     uint16_t in_port = ntohs(pi->in_port);
 
-    printf("This is a regular packet in (not discovery)\n");
-    printf("Preparing to insall flow\n");
+    log_msg(sw, "This is a regular packet in (not discovery)\n");
+    log_msg(sw, "Preparing to insall flow\n");
     /* extract information used for the flow resulting from this packet */
     uint8_t *eth_frame = pi->data;
     uint8_t *dst_mac = eth_frame + ETH_DST_OFFSET;
     uint8_t *src_mac = eth_frame + ETH_SRC_OFFSET;
     // uint16_t eth_type = ntohs(*(uint16_t *)(eth_frame + ETH_ETHERTYPE_OFFSET));
+
+
+    log_msg(sw, "Learning MAC %02x:%02x:%02x:%02x:%02x:%02x on switch port %d\n",
+        src_mac[0], src_mac[1], src_mac[2], src_mac[3], src_mac[4], src_mac[5], in_port);
 
     /* add or update source mac to mac table */
     add_or_update_mac(src_mac, sw->datapath_id, in_port);
@@ -813,26 +909,26 @@ void handle_packet_in(struct switch_info *sw, struct ofp_packet_in *pi) {
     struct mac_entry *dst = find_mac(dst_mac);
 
     /* case for OFPR_ACTION */
-
-    if (dst_mac[0] == 0x01){ /* broadcast/multicast bit set*/
-        printf("Broadcast packet\n");
+    static const uint8_t BROADCAST_MAC[MAC_ADDR_LEN] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+    if (memcmp(dst_mac, BROADCAST_MAC, MAC_ADDR_LEN)){ /* broadcast/multicast bit set*/
+        log_msg(sw, "Broadcast packet\n");
         handle_broadcast_packet(sw, pi, find_mac(src_mac));
 
     } else {
 
         /* unicast packet */
         if (dst) { /* destination found in table so install a flow based on that */
-            printf("Destination MAC found in table\n");
+            log_msg(sw, "Destination MAC found in table sending unicast message\n");
             handle_unicast_packet(sw, pi, dst);
 
-            /* send the packet back to the switch that sent it */
 
-            
-            printf("Destination MAC found in table\n");
+
+
+
             
         } else { /* destination not found in table so flood similar to broadcast */
 
-            printf("Destination MAC not found in table, flooding with broadcast \n");
+            log_msg(sw, "Destination MAC not found in table, flooding with broadcast \n");
             handle_broadcast_packet(sw, pi, find_mac(src_mac));
             
         }
@@ -852,6 +948,8 @@ void handle_packet_in(struct switch_info *sw, struct ofp_packet_in *pi) {
 /* --------------------------------------------- ROUTING/FLOW INSTALLATION ----------------------------------------- */
 
 void handle_unicast_packet(struct switch_info *sw, struct ofp_packet_in *pi, struct mac_entry *dst){
+
+    log_msg(sw, "DEBUG: Attempting unicast path from switch to switch %016" PRIx64 "\n", dst->switch_dpid);
 
     /* extract data */
     uint64_t src_dpid = sw->datapath_id;
@@ -875,7 +973,7 @@ void handle_unicast_packet(struct switch_info *sw, struct ofp_packet_in *pi, str
 
     /* flood packet as backup */
     if (src_vertex_id < 0 || dst_vertex_id < 0) {
-        printf("Error: Can't find vertices for path calculation\n");
+        log_msg(sw, "ERROR: Can't find vertices for path calculation\n");
     
         /* CONSTRUCT PACKET OUT */
 
@@ -894,7 +992,7 @@ void handle_unicast_packet(struct switch_info *sw, struct ofp_packet_in *pi, str
     pthread_mutex_lock(&topology.lock);
     igraph_error_t result = igraph_get_shortest_path(&topology.graph, &vertices, &edges, src_vertex_id, dst_vertex_id, IGRAPH_OUT);
     if(result != IGRAPH_SUCCESS) {
-        printf("Error: Failed to calculate shortest path\n");
+        log_msg(sw, "ERROR: Failed to calculate shortest path\n");
         igraph_vector_int_destroy(&vertices);
         igraph_vector_int_destroy(&edges);
         return;
@@ -905,7 +1003,7 @@ void handle_unicast_packet(struct switch_info *sw, struct ofp_packet_in *pi, str
     igraph_integer_t num_edges = igraph_vector_int_size(&edges);
     igraph_integer_t i;
     if (num_edges == 0) {
-        printf("No path found between switches\n");
+        log_msg(sw, "No path found between switches\n");
         return;
     }
 
@@ -923,10 +1021,11 @@ void handle_unicast_packet(struct switch_info *sw, struct ofp_packet_in *pi, str
         /* extract port info from edge */
         igraph_integer_t src_port_from_edge = -1;
         src_port_from_edge = igraph_cattribute_EAN(&topology.graph, "src_port", edge_id);
-        if (src_port_from_edge > 65535){
+        if (src_port_from_edge <= 65535){
             src_port = (uint16_t)src_port_from_edge;
+            log_msg(sw, "DEBUG: Using src_port = %d\n", src_port);
         } else {
-            printf("Error: Failed to extract port info from edge\n");
+            log_msg(sw, "ERROR: Failed to extract port info from edge\n");
             pthread_mutex_unlock(&topology.lock);
             igraph_vector_int_destroy(&vertices);
             igraph_vector_int_destroy(&edges);
@@ -934,10 +1033,11 @@ void handle_unicast_packet(struct switch_info *sw, struct ofp_packet_in *pi, str
         }
         igraph_integer_t dst_port_from_edge = -1;
         dst_port_from_edge = igraph_cattribute_EAN(&topology.graph, "dst_port", edge_id);
-        if (dst_port_from_edge > 65535){
-            dst_port = (uint16_t)src_port_from_edge;
+        if (dst_port_from_edge <= 65535){
+            dst_port = (uint16_t)dst_port_from_edge;
+            log_msg(sw, "DEBUG: Using dst_port = %d\n", dst_port);
         } else {
-            printf("Error: Failed to extract port info from edge\n");
+            log_msg(sw, "ERROR: Failed to extract port info from edge\n");
             pthread_mutex_unlock(&topology.lock);
             igraph_vector_int_destroy(&vertices);
             igraph_vector_int_destroy(&edges);
@@ -945,10 +1045,10 @@ void handle_unicast_packet(struct switch_info *sw, struct ofp_packet_in *pi, str
         }
         igraph_integer_t src_dpid_from_edge = -1;
         src_dpid_from_edge = igraph_cattribute_EAN(&topology.graph, "src_dpid", edge_id);
-        if(src_dpid_from_edge < 65535){
+        if(src_dpid_from_edge > 0){
             curr_src_dpid = (uint64_t)src_dpid_from_edge;
         } else {
-            printf("Error: Failed to extract dpid info from edge\n");
+            log_msg(sw, "ERROR: Failed to extract dpid info from edge\n");
             pthread_mutex_unlock(&topology.lock);
             igraph_vector_int_destroy(&vertices);
             igraph_vector_int_destroy(&edges);
@@ -966,7 +1066,7 @@ void handle_unicast_packet(struct switch_info *sw, struct ofp_packet_in *pi, str
         }
 
         if (src_sw == NULL){
-            printf("Error: Failed to find switch with dpid %016" PRIx64 "\n", curr_src_dpid);
+            log_msg(sw, "ERROR: Failed to find switch with dpid %016" PRIx64 "\n", curr_src_dpid);
             pthread_mutex_unlock(&topology.lock);
             igraph_vector_int_destroy(&vertices);
             igraph_vector_int_destroy(&edges);
@@ -975,12 +1075,18 @@ void handle_unicast_packet(struct switch_info *sw, struct ofp_packet_in *pi, str
         pthread_mutex_unlock(&topology.lock);
 
 
+        log_msg(sw, "DEBUG: Edge attributes - src_dpid=%f, dst_dpid=%f, src_port=%f, dst_port=%f\n",
+            igraph_cattribute_EAN(&topology.graph, "src_dpid", edge_id),
+            igraph_cattribute_EAN(&topology.graph, "dst_dpid", edge_id),
+            igraph_cattribute_EAN(&topology.graph, "src_port", edge_id),
+            igraph_cattribute_EAN(&topology.graph, "dst_port", edge_id));
+
 
         /* install flow */
         install_flow(src_sw, src_port, dst_port, ntohl(pi->buffer_id), dst);
 
         /* log flow installation */
-        printf("Flow installed on switch %016" PRIx64 ":\n", src_dpid);
+        log_msg(sw, "Flow installed on switch %016" PRIx64 ":\n", src_dpid);
     }
 
     /* after all flows are installed send a packet out */
@@ -992,134 +1098,317 @@ void handle_unicast_packet(struct switch_info *sw, struct ofp_packet_in *pi, str
 
 }
 
-void handle_broadcast_packet(struct switch_info *sw, struct ofp_packet_in *pi, struct mac_entry *src){
+bool test_simple_flow_mod(struct switch_info *sw, uint16_t in_port, uint16_t out_port) {
+    log_msg(sw, "DEBUG: Testing minimal flow mod: in_port=%d -> out_port=%d\n", in_port, out_port);
+    
+    // Minimal flow mod message
+    int action_len = sizeof(struct ofp_action_output);
+    int total_len = sizeof(struct ofp_flow_mod) + action_len;
+    
+    struct ofp_flow_mod *fm = malloc(total_len);
+    if (!fm) {
+        log_msg(sw, "ERROR: Memory allocation failed\n");
+        return false;
+    }
+    
+    memset(fm, 0, total_len);
+    
+    // Header
+    fm->header.version = OFP_VERSION;
+    fm->header.type = OFPT_FLOW_MOD;
+    fm->header.length = htons(total_len);
+    fm->header.xid = htonl(0);  // Fixed XID for easier debugging
+    
+    // Match only on in_port
+    fm->match.wildcards = htonl(OFPFW_ALL & ~OFPFW_IN_PORT);
+    fm->match.in_port = htons(in_port);
+    
+    // Minimal flow parameters
+    fm->command = htons(OFPFC_ADD);
+    fm->idle_timeout = htons(10);  // Short timeout
+    fm->hard_timeout = htons(0);   // No hard timeout
+    fm->priority = htons(100);     // Lower than default
+    fm->buffer_id = htonl(0xFFFFFFFF);  // NO_BUFFER
+    fm->flags = 0;
+    
+    // Single output action
+    struct ofp_action_output *action = (struct ofp_action_output *)fm->actions;
+    action->type = htons(OFPAT_OUTPUT);
+    action->len = htons(sizeof(struct ofp_action_output));
+    action->port = htons(out_port);
+    action->max_len = htons(0);
+    
+    // Add a delay before sending
+    usleep(50000);  // 50ms pause to ensure the connection is stable
+    
+    log_msg(sw, "DEBUG: Sending minimal test flow mod\n");
+    pthread_mutex_lock(&sw->lock);
+    
+    if (!sw->active) {
+        log_msg(sw, "ERROR: Switch inactive before flow mod\n");
+        pthread_mutex_unlock(&sw->lock);
+        free(fm);
+        return false;
+    }
+    
+    // Send with more careful error handling
+    ssize_t sent = send(sw->socket, fm, total_len, 0);
+    if (sent < 0) {
+        log_msg(sw, "ERROR: Flow mod send failed: %s\n", strerror(errno));
+        pthread_mutex_unlock(&sw->lock);
+        free(fm);
+        return false;
+    } else if (sent < total_len) {
+        log_msg(sw, "WARNING: Partial flow mod send: %zd of %d bytes\n", sent, total_len);
+    } else {
+        log_msg(sw, "SUCCESS: Sent complete flow mod: %zd bytes\n", sent);
+    }
+    
+    // Add another delay after sending
+    usleep(50000);  // 50ms pause
+    
+    if (!sw->active) {
+        log_msg(sw, "ERROR: Switch inactive immediately after flow mod\n");
+        pthread_mutex_unlock(&sw->lock);
+        free(fm);
+        return false;
+    }
+    
+    pthread_mutex_unlock(&sw->lock);
+    free(fm);
+    return true;
+}
 
-    /* init vectors for funciton call, path stored here */
-    igraph_vector_int_t res;
-    igraph_vector_int_init(&res, 0); /* vector of edge id's for minimum spanning tree*/
+void handle_broadcast_packet(struct switch_info *sw, struct ofp_packet_in *pi, struct mac_entry *src) {
+    uint16_t packet_in_port = ntohs(pi->in_port);
+    uint64_t packet_in_dpid = sw->datapath_id;
+
+    
+    
+    /* calculate MST of the network */
+    igraph_vector_int_t mst_edges;
+    igraph_vector_int_init(&mst_edges, 0);
 
     pthread_mutex_lock(&topology.lock);
-    igraph_error_t result = igraph_minimum_spanning_tree(&topology.graph, &res, NULL);
+    igraph_error_t result = igraph_minimum_spanning_tree(&topology.graph, &mst_edges, NULL);
     if(result != IGRAPH_SUCCESS) {
-        printf("Error: Failed to calculate minimum spanning tree\n");
-        igraph_vector_int_destroy(&res);
+        log_msg(sw, "ERROR: Failed to calculate minimum spanning tree\n");
+        igraph_vector_int_destroy(&mst_edges);
+        pthread_mutex_unlock(&topology.lock);
         return;
+    }
+    
+    igraph_integer_t num_edges = igraph_vector_int_size(&mst_edges);
+    log_msg(sw, "MST calculation result: %d, found %lld edges\n", result, num_edges);
+    
+    /* extract edge information (code remains the same) */
+    struct mst_edge {
+        uint64_t src_dpid;
+        uint64_t dst_dpid;
+        uint16_t src_port;
+        uint16_t dst_port;
+    };
+    
+    struct mst_edge *edges = malloc(num_edges * sizeof(struct mst_edge));
+    if (!edges) {
+        log_msg(sw, "ERROR: Failed to allocate memory for MST edges\n");
+        igraph_vector_int_destroy(&mst_edges);
+        pthread_mutex_unlock(&topology.lock);
+        return;
+    }
+    
+    /* extract edge information */
+    for (igraph_integer_t i = 0; i < num_edges; i++) {
+        igraph_integer_t edge_id = VECTOR(mst_edges)[i];
+        
+        edges[i].src_dpid = (uint64_t)EAN(&topology.graph, "src_dpid", edge_id);
+        edges[i].dst_dpid = (uint64_t)EAN(&topology.graph, "dst_dpid", edge_id);
+        edges[i].src_port = (uint16_t)EAN(&topology.graph, "src_port", edge_id);
+        edges[i].dst_port = (uint16_t)EAN(&topology.graph, "dst_port", edge_id);
+        
+        log_msg(sw, "MST Edge %lld: src_dpid=%llu (port %d) -> dst_dpid=%llu (port %d)\n",
+               i, edges[i].src_dpid, edges[i].src_port, edges[i].dst_dpid, edges[i].dst_port);
     }
     pthread_mutex_unlock(&topology.lock);
-
-    /* get total edges from spanning tree */
-    igraph_integer_t num_edges = igraph_vector_int_size(&res);
-    igraph_integer_t i;
-
-    /* entry for flow installation */
-    struct mac_entry *entry = malloc(sizeof(struct mac_entry));
-    if (!entry) {
-        printf("Error: Failed to allocate memory for mac entry\n");
-        igraph_vector_int_destroy(&res);
+    log_msg(sw, "MST edges extracted\n");
+    
+    /* create broadcast MAC entry */
+    struct mac_entry *bcast_entry = malloc(sizeof(struct mac_entry));
+    if (!bcast_entry) {
+        log_msg(sw, "ERROR: Failed to allocate memory for broadcast MAC entry\n");
+        free(edges);
+        igraph_vector_int_destroy(&mst_edges);
         return;
     }
-
-    memset(entry, 0, sizeof(struct mac_entry));
-    memset(entry->mac, 0xFF, MAC_ADDR_LEN);
-
-    /* these feilds dont really matter for this struct */
-    entry->switch_dpid = 0;
-    entry->port_no = 0;
-
-    uint16_t src_port = -1;
-    uint16_t dst_port = -1;
-    uint64_t curr_src_dpid = -1;
-    /* iterate over all the edges from sapnning tree */
-    for (i = 0; i < num_edges; i++){
-        igraph_integer_t edge_id = VECTOR(res)[i]; /* res is result of finding minimum path */
-        igraph_integer_t src_vertex, dst_vertex;
-
-        pthread_mutex_lock(&topology.lock);
-        igraph_edge(&topology.graph, edge_id, &src_vertex, &dst_vertex);
-
-        /* extract port info from edge */
-        igraph_integer_t src_port_from_edge = igraph_cattribute_EAN(&topology.graph, "src_port", edge_id);
-        if (src_port_from_edge < 65535){
-            src_port = (uint16_t)src_port_from_edge;
-        } else {
-            printf("Error: Failed to extract port info from edge\n");
-            pthread_mutex_unlock(&topology.lock);
-            igraph_vector_int_destroy(&res);
-            free(entry);
-            return;
-        }
-        igraph_integer_t dst_port_from_edge = igraph_cattribute_EAN(&topology.graph, "dst_port", edge_id);
-        if (dst_port_from_edge < 65535){
-            dst_port = (uint16_t)src_port_from_edge;
-        } else {
-            printf("Error: Failed to extract port info from edge\n");
-            pthread_mutex_unlock(&topology.lock);
-            igraph_vector_int_destroy(&res);
-            free(entry);
-            return;
-        }
-        igraph_integer_t src_dpid_from_edge = -1;
-        src_dpid_from_edge = igraph_cattribute_EAN(&topology.graph, "src_dpid", edge_id);
-        if(src_dpid_from_edge < 65535){
-            curr_src_dpid = (uint64_t)src_dpid_from_edge;
-        } else {
-            printf("Error: Failed to extract dpid info from edge\n");
-            pthread_mutex_unlock(&topology.lock);
-            igraph_vector_int_destroy(&res);
-            free(entry);
-            return;
-        }
-        struct switch_info *src_sw = NULL;
-        int i;
-        for (i = 0; i < MAX_SWITCHES; i++) {
-            if (switches[i].active && switches[i].datapath_id == curr_src_dpid) {
-                src_sw = &switches[i];
-                break;
+    memset(bcast_entry, 0, sizeof(struct mac_entry));
+    memset(bcast_entry->mac, 0xFF, MAC_ADDR_LEN);
+    
+    /* process the switch that received the packet first */
+    /* we need to find all MST ports on this switch, excluding the incoming port */
+    uint16_t out_ports[MAX_PORTS_PER_SWITCH];
+    int num_out_ports = 0;
+    
+    /* add all MST ports except the incoming port */
+    log_msg(sw, "Processing switch for broadcast, identifying output ports\n", packet_in_dpid);
+    for (igraph_integer_t i = 0; i < num_edges; i++) {
+        if (edges[i].src_dpid == packet_in_dpid) {
+            if (edges[i].src_port != packet_in_port) {
+                out_ports[num_out_ports++] = edges[i].src_port;
+            }
+        } else if (edges[i].dst_dpid == packet_in_dpid) {
+            if (edges[i].dst_port != packet_in_port) {
+                out_ports[num_out_ports++] = edges[i].dst_port;
             }
         }
-
-        if (src_sw == NULL){
-            printf("Error: Failed to find switch with dpid %016" PRIx64 "\n", curr_src_dpid);
-            pthread_mutex_unlock(&topology.lock);
-            igraph_vector_int_destroy(&res);
-            free(entry);
-            return;
+    }
+    
+    /* also add access ports (ports that connect to hosts, not in MST) */
+    int i;
+    for (i = 0; i < sw->num_ports; i++) {
+        uint16_t port_no = ntohs(sw->ports[i].port_no);
+        if (port_no < OFPP_MAX && port_no != packet_in_port) {
+            /* check if this port is already in out_ports (part of MST) */
+            bool is_mst_port = false;
+            for (int j = 0; j < num_out_ports; j++) {
+                if (out_ports[j] == port_no) {
+                    is_mst_port = true;
+                    break;
+                }
+            }
+            
+            /* if not part of MST and not the incoming port, add it */
+            if (!is_mst_port) {
+                out_ports[num_out_ports++] = port_no;
+            }
         }
-
-        /* get the switch struct that is at the src of the edge */
-
-        pthread_mutex_unlock(&topology.lock);
-
-
-
-        /* install flow */
-        install_flow(src_sw, src_port, dst_port, ntohl(pi->buffer_id), entry);
-
-        /* for each flow send a packet out */
-        send_packet_out(sw, src_port, dst_port, pi->buffer_id, pi->data, ntohs(pi->total_len));
-
     }
 
-    /* clean up */
-    igraph_vector_int_destroy(&res);
-    free(entry);
+    // In your handle_broadcast_packet function:
+    if (test_simple_flow_mod(sw, packet_in_port, out_ports[0])) {
+        log_msg(sw, "Simple flow mod test succeeded\n");
+        // Continue with the rest of your broadcast handling
+    } else {
+        log_msg(sw, "Simple flow mod test failed, skipping MST flows\n");
+        // Just send packet out instead
+        for (int i = 0; i < num_out_ports; i++) {
+            send_packet_out(sw, packet_in_port, out_ports[i], 
+                        (i == 0) ? ntohl(pi->buffer_id) : 0xFFFFFFFF, 
+                        pi->data, ntohs(pi->total_len));
+        }
+    }
+    
+    
+    /* install separate flow for each output port */
+    log_msg(sw, "Installing %d separate broadcast flows on switch %016" PRIx64 "\n", 
+            num_out_ports, packet_in_dpid);
+    
+    for (i = 0; i < num_out_ports; i++) {
+        install_single_output_flow(sw, packet_in_port, out_ports[i], 0xFFFFFFFF, bcast_entry);
+        /* add small delay between flow installations */
+        usleep(10000); /* 10ms delay */
+    }
 
+    
+    /* Now process other switches in the MST - similar to before */
+    for (int i = 0; i < MAX_SWITCHES; i++) {
+        if (switches[i].active && switches[i].datapath_id != packet_in_dpid) {
+            struct switch_info *other_sw = &switches[i];
+            uint64_t other_dpid = other_sw->datapath_id;
+            
+            uint16_t ingress_port = OFPP_NONE;
+            for (igraph_integer_t j = 0; j < num_edges; j++) {
+                if (edges[j].src_dpid == other_dpid || edges[j].dst_dpid == other_dpid) {
+                    if (edges[j].src_dpid == other_dpid) {
+                        ingress_port = edges[j].src_port;
+                    } else {
+                        ingress_port = edges[j].dst_port;
+                    }
+                    break;
+                }
+            }
+            
+            if (ingress_port != OFPP_NONE) {
+                uint16_t other_out_ports[MAX_PORTS_PER_SWITCH];
+                int other_num_out_ports = 0;
+                
+                for (igraph_integer_t k = 0; k < num_edges; k++) {
+                    if (edges[k].src_dpid == other_dpid && edges[k].src_port != ingress_port) {
+                        other_out_ports[other_num_out_ports++] = edges[k].src_port;
+                    }
+                    if (edges[k].dst_dpid == other_dpid && edges[k].dst_port != ingress_port) {
+                        other_out_ports[other_num_out_ports++] = edges[k].dst_port;
+                    }
+                }
+                
+                for (int p = 0; p < other_sw->num_ports; p++) {
+                    uint16_t port_no = ntohs(other_sw->ports[p].port_no);
+                    if (port_no < OFPP_MAX && port_no != ingress_port) {
+                        bool is_mst_port = false;
+                        for (int q = 0; q < other_num_out_ports; q++) {
+                            if (other_out_ports[q] == port_no) {
+                                is_mst_port = true;
+                                break;
+                            }
+                        }
+                        
+                        if (!is_mst_port) {
+                            other_out_ports[other_num_out_ports++] = port_no;
+                        }
+                    }
+                }
+                
+                log_msg(sw, "Installing %d separate broadcast flows on other switch %016" PRIx64 "\n", 
+                        other_num_out_ports, other_dpid);
+                
+                for (int p = 0; p < other_num_out_ports; p++) {
+                    install_single_output_flow(other_sw, ingress_port, other_out_ports[p], 
+                                              0xFFFFFFFF, bcast_entry);
+                    usleep(10000); /* Add slight delay between installations */
+                }
+            }
+        }
+    }
+    
+    /* Send packet out on first switch - no change needed */
+    if (num_out_ports > 0) {
+        uint32_t buffer_id = ntohl(pi->buffer_id);
+        
+        for (int i = 0; i < num_out_ports; i++) {
+            /* For each output port, send the packet out */
+            send_packet_out(sw, packet_in_port, out_ports[i], 
+                          (i == 0) ? buffer_id : 0xFFFFFFFF, 
+                          pi->data, ntohs(pi->total_len));
+        }
+    }
+    
+    /* Clean up */
+    free(bcast_entry);
+    free(edges);
+    igraph_vector_int_destroy(&mst_edges);
 }
 
 /* function for installing a flow to a switch once links have been discovered */
 void install_flow(struct switch_info *sw, uint16_t in_port, uint16_t dst_port, uint32_t buff_id, struct mac_entry *dst){
     
     if(dst_port < 0 || in_port < 0){
-        printf("Error: Invalid port number in attempeted flow install\n");
+        log_msg(sw, "ERROR: Invalid port number in attempeted flow install\n");
         return;
     }
+
+    log_msg(sw, "DEBUG: Installing flow on switch %016" PRIx64 ": in_port=%d -> out_port=%d, dst_mac=%02x:%02x:%02x:%02x:%02x:%02x\n", 
+           sw->datapath_id, in_port, dst_port,
+           dst->mac[0], dst->mac[1], dst->mac[2], dst->mac[3], dst->mac[4], dst->mac[5]);
+
+    log_msg(sw, "Current topology: %lld vertices, %lld edges\n", 
+       igraph_vcount(&topology.graph), 
+       igraph_ecount(&topology.graph));
 
     int action_len = sizeof(struct ofp_action_output);
     int total_len = sizeof(struct ofp_flow_mod) + action_len;
 
     struct ofp_flow_mod * fm = malloc(total_len); 
     if (!fm) {
-        printf("Error: Failed to allocate memory for flow_mod\n");
+        log_msg(sw, "ERROR: Failed to allocate memory for flow_mod\n");
         return;
     }
     memset(fm, 0, total_len);
@@ -1157,33 +1446,89 @@ void install_flow(struct switch_info *sw, uint16_t in_port, uint16_t dst_port, u
     action->port = htons(dst_port);
     action->max_len = htons(0); /* no buffer limit */
 
+    log_msg(sw, "DEBUG: Flow details: wildcards=0x%x, match.in_port=%d, action.port=%d\n",
+           ntohl(fm->match.wildcards), ntohs(fm->match.in_port), ntohs(action->port));
+
     /* send the flow_mod message to the switch */
     send_openflow_msg(sw, fm, total_len);
 
-    printf("Flow installed on switch %016" PRIx64 ":\n", sw->datapath_id);
+    log_msg(sw, "DEBUG: Flow installation complete for switch, buffer ID: %u\n", 
+           sw->datapath_id, buff_id);
+
+    free(fm);
+}
+
+void install_single_output_flow(struct switch_info *sw, uint16_t in_port, uint16_t out_port, 
+                              uint32_t buffer_id, struct mac_entry *dst) {
+    if(out_port < 0 || in_port < 0) {
+        log_msg(sw, "ERROR: Invalid port number in attempted flow install\n");
+        return;
+    }
+
+    log_msg(sw, "DEBUG: Installing single output flow on switch %016" PRIx64 ": in_port=%d -> out_port=%d\n", 
+            sw->datapath_id, in_port, out_port);
+
+    int action_len = sizeof(struct ofp_action_output);
+    int total_len = sizeof(struct ofp_flow_mod) + action_len;
+
+    struct ofp_flow_mod *fm = malloc(total_len); 
+    if (!fm) {
+        log_msg(sw, "ERROR: Failed to allocate memory for flow_mod\n");
+        return;
+    }
+    memset(fm, 0, total_len);
+
+    /* setup header */
+    fm->header.version = OFP_VERSION;
+    fm->header.type = OFPT_FLOW_MOD;
+    fm->header.length = htons(total_len);
+    fm->header.xid = htonl(sw->packet_in_count++);
+
+    /* match on in_port and broadcast MAC */
+    fm->match.wildcards = htonl(OFPFW_ALL & ~OFPFW_IN_PORT & ~OFPFW_DL_DST);
+    fm->match.in_port = htons(in_port);
+    memcpy(fm->match.dl_dst, dst->mac, OFP_ETH_ALEN);
+
+    /* set flow parameters */
+    fm->command = htons(OFPFC_ADD);
+    fm->idle_timeout = htons(60);   /* 60 seconds idle timeout */
+    fm->hard_timeout = htons(300);  /* 5 minutes hard timeout */
+    fm->priority = htons(OFP_DEFAULT_PRIORITY);
+    fm->buffer_id = htonl(0xFFFFFFFF); /* Don't use buffer ID for these flows */
+    fm->flags = htons(OFPFF_SEND_FLOW_REM);
+
+    /* setup action for single output port */
+    struct ofp_action_output *action = (struct ofp_action_output *)fm->actions;
+    action->type = htons(OFPAT_OUTPUT);
+    action->len = htons(sizeof(struct ofp_action_output));
+    action->port = htons(out_port);
+    action->max_len = htons(0);
+
+    /* send flow mod to switch */
+    log_msg(sw, "DEBUG: SENDING SIGNLE OUPUT FLOW TO SWITCH %016" PRIx64 ": in_port=%d -> out_port=%d\n", 
+            sw->datapath_id, in_port, out_port);
+    send_openflow_msg(sw, fm, total_len);
+    
+    log_msg(sw, "DEBUG: Single output flow installed on switch %016" PRIx64 ": in_port=%d -> out_port=%d\n", 
+            sw->datapath_id, in_port, out_port);
 
     free(fm);
 }
 
 /* a function for sending packet out fucntion to a swtich */
-void send_packet_out(struct switch_info *sw, uint16_t in_port, uint16_t out_port, uint32_t buff_id, uint8_t *data, size_t len){
+void send_packet_out(struct switch_info *sw, uint16_t in_port, uint16_t out_port, 
+                    uint32_t buffer_id, uint8_t *data, size_t len) {
     
-    /* packet structure
-     * packet out -> direct instruction to switch from controller 
-     * action packet -> output packet to specific port
-     * packet data
-     * */
-
-    if (in_port < 0 || out_port < 0){
-        printf("Error: Invalid port number in attempeted packet out\n");
+    if (in_port < 0 || out_port < 0) {
+        log_msg(sw, "ERROR: Invalid port number in attempted packet out\n");
         return;
     }
 
+    // Calculate size - if using buffer_id, we don't need to include data
     int action_len = sizeof(struct ofp_action_output);
-    int total_len = sizeof(struct ofp_packet_out) + action_len + len; /* will contain packet out, packet action, packet */
+    int data_len = (buffer_id == 0xFFFFFFFF) ? len : 0;
+    int total_len = sizeof(struct ofp_packet_out) + action_len + data_len;
     
-    /* ADD LOGIC FOR BUFFER ID */
-
     struct ofp_packet_out *po = malloc(total_len);
     if (!po) {
         printf("Error: Failed to allocate memory for packet_out\n");
@@ -1191,30 +1536,31 @@ void send_packet_out(struct switch_info *sw, uint16_t in_port, uint16_t out_port
     }
     memset(po, 0, total_len);
 
-    /* ofp header */
     po->header.version = OFP_VERSION;
     po->header.type = OFPT_PACKET_OUT;
     po->header.length = htons(total_len);
     po->header.xid = htonl(sw->packet_in_count++);
 
-    po->buffer_id = htonl(buff_id);
+    po->buffer_id = htonl(buffer_id);
     po->in_port = htons(in_port);
     po->actions_len = htons(sizeof(struct ofp_action_output));
 
-    /* setup the action which instructs the swtich to send the 
-     * packet contained out a specific port (out_port)*/
-    struct ofp_action_output *action = (struct ofp_action_output *)po->actions; /* cast */
-    action->type = htons(OFPAT_OUTPUT); /* outut to switch port */
+    struct ofp_action_output *action = (struct ofp_action_output *)po->actions;
+    action->type = htons(OFPAT_OUTPUT);
     action->len = htons(sizeof(struct ofp_action_output));
     action->port = htons(out_port);
     action->max_len = htons(0);
 
-    /* copy the data to be sent right after the action packet */
-    memcpy((uint8_t *)po + sizeof(struct ofp_packet_out) + action_len, data, len);
+    // Only copy data if we're not using a buffer_id
+    if (buffer_id == 0xFFFFFFFF && data != NULL) {
+        memcpy((uint8_t *)po + sizeof(struct ofp_packet_out) + action_len, data, len);
+    }
 
     send_openflow_msg(sw, po, total_len);
 
-    printf("Packet out sent to switch %016" PRIx64 ":\n", sw->datapath_id);
+    log_msg(sw, "Packet out sent to switch %016" PRIx64 ": in_port=%d, out_port=%d, buffer_id=%s\n", 
+           sw->datapath_id, in_port, out_port, 
+           (buffer_id == 0xFFFFFFFF) ? "NO_BUFFER" : "BUFFERED");
 
     free(po);
 }

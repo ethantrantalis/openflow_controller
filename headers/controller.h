@@ -102,7 +102,7 @@ extern struct dpid_to_vertex_map * dpids_to_vertex;
 
 /* function prototypes */
 void signal_handler(int signum); 
-void log_msg(const char *format, ...);
+void log_msg(struct switch_info * sw, const char *format, ...);
 void cleanup_switch(struct switch_info *sw);
 
 void add_or_update_mac(uint8_t *mac, uint64_t dpid, uint16_t port_no);
@@ -142,10 +142,10 @@ void handle_switch_join(struct switch_info *sw);
 void handle_switch_disconnect(struct switch_info *sw); 
 void handle_port_change(struct switch_info *sw, uint16_t src_port_no, bool is_up); 
 
-void add_or_update_link(uint64_t src_dpid, uint16_t src_port, uint64_t dst_dpid, uint16_t dst_port);
-void add_vertex(uint64_t dpid); 
-void remove_links_for_port(uint64_t dpid, uint16_t src_port_no);
-void remove_all_switch_links(uint64_t dpid);
+void add_or_update_link(uint64_t src_dpid, uint16_t src_port, uint64_t dst_dpid, uint16_t dst_port, struct switch_info * sw);
+void add_vertex(uint64_t dpid, struct switch_info * sw); 
+void remove_links_for_port(uint64_t dpid, uint16_t src_port_no, struct switch_info * sw);
+void remove_all_switch_links(uint64_t dpid, struct switch_info * sw);
 uint64_t vertex_to_dpid(igraph_integer_t vertex_id);
 
 void send_topology_discovery_packet(struct switch_info *sw, uint16_t port_no);
@@ -158,5 +158,6 @@ void handle_unicast_packet(struct switch_info *sw, struct ofp_packet_in *pi, str
 void handle_broadcast_packet(struct switch_info *sw, struct ofp_packet_in *pi, struct mac_entry *src);
 void install_flow(struct switch_info *sw, uint16_t in_port, uint16_t dst_port, uint32_t buff_id, struct mac_entry *dst);
 void send_packet_out(struct switch_info *sw, uint16_t in_port, uint16_t out_port, uint32_t buff_id, uint8_t *data, size_t len);
-
+void install_single_output_flow(struct switch_info *sw, uint16_t in_port, uint16_t out_port, 
+                              uint32_t buffer_id, struct mac_entry *dst);
 #endif
