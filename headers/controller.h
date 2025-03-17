@@ -24,6 +24,7 @@
 #define ECHO_TIMEOUT       15    /* connection is dead if no reply for 15 seconds */
 #define CLEANUP_INTERVAL   30
 #define MAC_ADDR_LEN 6
+#define MAX_FLOWS 1000  /* Maximum number of flows to track */
 
 /* lldp packet strcutre offsets */
 #define LLDP_DST_MAC_OFFSET 0
@@ -62,7 +63,7 @@ struct switch_info {
     int hello_received;     /* track if HELLO was received */
     int features_received;  /* track FEATURES_REPLY receipt */
 
-    /* echoe for connections */
+    /* echo for connections */
     time_t last_echo;      /* last echo request sent */
     time_t last_echo_reply; /* last echo reply received */
     uint32_t echo_xid; 
@@ -70,6 +71,13 @@ struct switch_info {
     bool echo_pending;          /* whether we're waiting for a reply */
 
     pthread_mutex_t lock;      /* thread safety */
+
+    struct pending_message *outgoing_queue;
+    pthread_mutex_t queue_lock;
+
+    struct flow_entry *flow_table;
+    int num_flows;
+    pthread_mutex_t flow_table_lock;
 };
 
 struct mac_entry {
@@ -77,6 +85,7 @@ struct mac_entry {
     uint64_t switch_dpid;
     uint16_t port_no;
     time_t last_seen;
+    bool is_trunk; 
     UT_hash_handle hh; /* makes this structure hashable */
 }; 
 
@@ -92,6 +101,24 @@ struct network_topology {
     
 };
 
+struct pending_message {
+    void *data;
+    size_t length;
+    size_t sent;
+    struct pending_message *next;
+};
+
+/* structure to track installed flows */
+struct flow_entry {
+    uint64_t switch_dpid;
+    uint16_t in_port;
+    uint8_t dst_mac[MAC_ADDR_LEN];
+    uint16_t out_port;
+    time_t install_time;
+    bool active;  /* is this entry active */
+};
+
+
 /* global variables */
 extern struct switch_info switches[MAX_SWITCHES];
 extern pthread_mutex_t switches_lock;
@@ -100,18 +127,26 @@ extern volatile int running; /* for controller clean up and running */
 extern struct network_topology topology;
 extern struct dpid_to_vertex_map * dpids_to_vertex;
 
+
 /* function prototypes */
 void signal_handler(int signum); 
 void log_msg(struct switch_info * sw, const char *format, ...);
 void cleanup_switch(struct switch_info *sw);
 
-void add_or_update_mac(uint8_t *mac, uint64_t dpid, uint16_t port_no);
+void add_or_update_mac(struct switch_info * sw, uint8_t *mac, uint64_t dpid, uint16_t port_no);
 struct mac_entry *find_mac(uint8_t *mac);
 
 void add_or_update_dpid(uint64_t dpid, igraph_integer_t vertex_id);
 bool dpid_exists(uint64_t dpid);
-igraph_integer_t find_vertexid(uint64_t dpid);
+igraph_integer_t find_vertexid(struct switch_info *sw, uint64_t dpid);
 void delete_dpid_mapping(uint64_t dpid);
+
+bool is_trunk_port(struct switch_info * sw, uint64_t dpid, uint16_t port_no);
+
+/* flow tracking function prototypes */
+void init_flow_table(void);
+bool add_flow_entry(struct switch_info *sw, uint64_t dpid, uint16_t in_port, uint8_t *dst_mac, uint16_t out_port);
+bool flow_exists(struct switch_info * sw, uint64_t dpid, uint16_t in_port, uint8_t *dst_mac, uint16_t out_port);
 
 int main(int argc, char *argv[]);
 void init_controller(int port); 
@@ -122,7 +157,8 @@ void *switch_handler(void *arg);
 void send_hello(struct switch_info *sw);
 void handle_hello(struct switch_info *sw, struct ofp_header *oh);
 
-void send_openflow_msg(struct switch_info *sw, void *msg, size_t len);
+void queue_openflow_msg(struct switch_info *sw, void *msg, size_t len);
+void process_outgoing_queue(struct switch_info *sw);
 void handle_switch_message(struct switch_info *sw, uint8_t *msg, size_t len);
 
 void send_features_request(struct switch_info *sw);
@@ -146,8 +182,12 @@ void add_or_update_link(uint64_t src_dpid, uint16_t src_port, uint64_t dst_dpid,
 void add_vertex(uint64_t dpid, struct switch_info * sw); 
 void remove_links_for_port(uint64_t dpid, uint16_t src_port_no, struct switch_info * sw);
 void remove_all_switch_links(uint64_t dpid, struct switch_info * sw);
-uint64_t vertex_to_dpid(igraph_integer_t vertex_id);
-
+uint64_t vertex_to_dpid(igraph_integer_t vertex_id, struct switch_info * sw); 
+bool validate_path(uint64_t src_dpid, uint16_t src_port, 
+                   uint64_t dst_dpid, uint16_t dst_port,
+                   uint64_t *switch_dpids, uint16_t *ingress_ports, 
+                   uint16_t *egress_ports, int num_hops, struct switch_info *sw);
+                   
 void send_topology_discovery_packet(struct switch_info *sw, uint16_t port_no);
 bool is_topology_discovery_packet(uint8_t *data, size_t len);
 bool extract_discovery_packet_info(uint8_t *data, size_t len, uint64_t *src_dpid, uint16_t *src_port);
@@ -158,6 +198,6 @@ void handle_unicast_packet(struct switch_info *sw, struct ofp_packet_in *pi, str
 void handle_broadcast_packet(struct switch_info *sw, struct ofp_packet_in *pi, struct mac_entry *src);
 void install_flow(struct switch_info *sw, uint16_t in_port, uint16_t dst_port, uint32_t buff_id, struct mac_entry *dst);
 void send_packet_out(struct switch_info *sw, uint16_t in_port, uint16_t out_port, uint32_t buff_id, uint8_t *data, size_t len);
-void install_single_output_flow(struct switch_info *sw, uint16_t in_port, uint16_t out_port, 
-                              uint32_t buffer_id, struct mac_entry *dst);
+bool is_port_in_mst(struct switch_info * sw, uint64_t dpid, uint16_t port_no, igraph_vector_int_t *mst_edges);
+uint16_t find_port_to_next_hop(struct switch_info *sw, uint64_t src_dpid, uint64_t dst_dpid);
 #endif
