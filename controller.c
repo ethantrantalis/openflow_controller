@@ -104,7 +104,7 @@ bool add_flow_entry(struct switch_info *sw, uint64_t dpid, uint16_t in_port, uin
 
     log_msg(sw, "DEBUG: Adding new flow to switch flow table with dpid %016" PRIx64 " in_port %u dst_mac %02x:%02x:%02x:%02x:%02x:%02x out_port %u\n",
             dpid, in_port, dst_mac[0], dst_mac[1], dst_mac[2], dst_mac[3], dst_mac[4], dst_mac[5], out_port);
-    log_msg(sw, "MUTEX: Locking flow table\n");
+    //log_msg(sw, "MUTEX: Locking flow table\n");
     pthread_mutex_lock(&sw->flow_table_lock);    
     /* first check if the flow already exists */
     for (int i = 0; i < sw->num_flows; i++) {
@@ -119,7 +119,7 @@ bool add_flow_entry(struct switch_info *sw, uint64_t dpid, uint16_t in_port, uin
             log_msg(sw, "DEBUG: Flow already exists, updating timestamp\n");
 
             pthread_mutex_unlock(&sw->flow_table_lock);
-            log_msg(sw, "MUTEX: Unlocked flow table\n");
+            // log_msg(sw, "MUTEX: Unlocked flow table\n");
             return false;  /* flow wasn't newly added */
         }
     }
@@ -129,7 +129,7 @@ bool add_flow_entry(struct switch_info *sw, uint64_t dpid, uint16_t in_port, uin
         log_msg(NULL, "ERROR: Flow table full, cannot add new flow\n");
 
         pthread_mutex_unlock(&sw->flow_table_lock);
-        log_msg(sw, "MUTEX: Unlocked flow table\n");
+        // log_msg(sw, "MUTEX: Unlocked flow table\n");
 
         return false;
     }
@@ -145,7 +145,7 @@ bool add_flow_entry(struct switch_info *sw, uint64_t dpid, uint16_t in_port, uin
     log_msg(sw, "DEBUG: Added new flow to switch flow table\n");
     
     pthread_mutex_unlock(&sw->flow_table_lock);
-    log_msg(sw, "MUTEX: Unlocked flow table\n");
+    // log_msg(sw, "MUTEX: Unlocked flow table\n");
     return true;  /* new flow was added */
 }
 
@@ -153,7 +153,7 @@ bool add_flow_entry(struct switch_info *sw, uint64_t dpid, uint16_t in_port, uin
 bool flow_exists(struct switch_info * sw, uint64_t dpid, uint16_t in_port, uint8_t *dst_mac, uint16_t out_port) {
     bool exists = false;
     
-    log_msg(sw, "MUTEX: Locking flow table\n");
+    // log_msg(sw, "MUTEX: Locking flow table\n");
     pthread_mutex_lock(&sw->flow_table_lock);
 
     for (int i = 0; i < sw->num_flows; i++) {
@@ -170,7 +170,7 @@ bool flow_exists(struct switch_info * sw, uint64_t dpid, uint16_t in_port, uint8
     
     /* exit with existance of flow */
     pthread_mutex_unlock(&sw->flow_table_lock);
-    log_msg(sw, "MUTEX: Unlocked flow table\n");
+    // log_msg(sw, "MUTEX: Unlocked flow table\n");
     return exists;
 }
 
@@ -208,7 +208,7 @@ bool is_trunk_port(struct switch_info * sw, uint64_t dpid, uint16_t port_no) {
 
     
     /* a port is a trunk port if it appears in any edge in the topology graph */
-    log_msg(sw, "MUTEX: Locking topology\n");
+    // log_msg(sw, "MUTEX: Locking topology\n");
     pthread_mutex_lock(&topology.lock);
     for (igraph_integer_t i = 0; i < igraph_ecount(&topology.graph); i++) {
         uint64_t src_dpid = (uint64_t)EAN(&topology.graph, "src_dpid", i);
@@ -221,13 +221,13 @@ bool is_trunk_port(struct switch_info * sw, uint64_t dpid, uint16_t port_no) {
             (dst_dpid == dpid && dst_port == port_no)) {
             
             pthread_mutex_unlock(&topology.lock);
-            log_msg(sw, "MUTEX: Unlocked topology\n");
+            // log_msg(sw, "MUTEX: Unlocked topology\n");
             return true;
         }
     }
     
     pthread_mutex_unlock(&topology.lock);
-    log_msg(sw, "MUTEX: Unlocked topology\n");
+    // log_msg(sw, "MUTEX: Unlocked topology\n");
     return false;
 }
 
@@ -238,54 +238,89 @@ struct mac_entry *mac_table = NULL;
 pthread_mutex_t mac_table_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* add or update an entry */
-void add_or_update_mac(struct switch_info * sw, uint8_t *mac, uint64_t dpid, uint16_t port_no) {
+void add_or_update_mac(struct switch_info *sw, uint8_t *mac, uint64_t dpid, uint16_t port_no) {
+    /* First determine if this port is a trunk port */
     bool is_trunk = is_trunk_port(sw, dpid, port_no);
 
-    log_msg(sw, "DEBUG: Adding or updating MAC %02x:%02x:%02x:%02x:%02x:%02x from switch %016" PRIx64 " port %d\n",
-            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], dpid, port_no);
+    log_msg(sw, "DEBUG: Adding or updating MAC %02x:%02x:%02x:%02x:%02x:%02x from switch %016" PRIx64 " port %d (is_trunk=%d)\n",
+            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], dpid, port_no, is_trunk);
 
-    log_msg(sw, "MUTEX: Locking MAC table\n");
     pthread_mutex_lock(&mac_table_lock);
 
     struct mac_entry *entry;
     
+    /* Look up existing entry */
     HASH_FIND(hh, mac_table, mac, MAC_ADDR_LEN, entry);
     
-    /* don't update existing entries if this is a trunk port */
-    if (entry != NULL && is_trunk) {
-        log_msg(sw, "DEBUG: Not updating MAC entry for %02x:%02x:%02x:%02x:%02x:%02x as it was seen on trunk port %d\n",
-            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], port_no);
-        pthread_mutex_unlock(&mac_table_lock);
-        log_msg(sw, "MUTEX: Unlocked MAC table\n");
-        return;
-    }
-    
+    /* Case 1: No existing entry - always add new entry regardless of trunk status */
     if (entry == NULL) {
         entry = malloc(sizeof(struct mac_entry));
+        if (!entry) {
+            log_msg(sw, "ERROR: Failed to allocate memory for MAC entry\n");
+            pthread_mutex_unlock(&mac_table_lock);
+            return;
+        }
+        
         memcpy(entry->mac, mac, MAC_ADDR_LEN);
+        entry->switch_dpid = dpid;
+        entry->port_no = port_no;
+        entry->last_seen = time(NULL);
+        entry->is_trunk = is_trunk;
         HASH_ADD(hh, mac_table, mac, MAC_ADDR_LEN, entry);
-        printf("DEBUG: Added new MAC %02x:%02x:%02x:%02x:%02x:%02x to table for switch %016" PRIx64 " port %d\n",
-               mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], dpid, port_no);
-    } else {
-        printf("DEBUG: Updated MAC %02x:%02x:%02x:%02x:%02x:%02x from switch %016" PRIx64 " port %d to switch %016" PRIx64 " port %d\n",
-               mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], 
-               entry->switch_dpid, entry->port_no, dpid, port_no);
+        
+        log_msg(sw, "DEBUG: Added new MAC %02x:%02x:%02x:%02x:%02x:%02x to table for switch %016" PRIx64 " port %d (is_trunk=%d)\n",
+                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], dpid, port_no, is_trunk);
     }
-    
-    /* only update the entry if we haven't returned early */
-    entry->switch_dpid = dpid;
-    entry->port_no = port_no;
-    entry->last_seen = time(NULL);
-    entry->is_trunk = is_trunk;
+    /* Case 2: Existing entry - need to decide whether to update */
+    else {
+        bool should_update = false;
+        
+        /* Case 2a: New info is from non-trunk port (direct connection) */
+        if (!is_trunk) {
+            /* Always prefer direct connections */
+            should_update = true;
+            log_msg(sw, "DEBUG: Updating MAC with direct connection (old is_trunk=%d, new is_trunk=%d)\n", 
+                    entry->is_trunk, is_trunk);
+        }
+        /* Case 2b: New info is from trunk port, existing entry is from trunk port */
+        else if (entry->is_trunk) {
+            /* Update if the existing trunk entry is old or if trunk port has changed */
+            time_t current_time = time(NULL);
+            if ((current_time - entry->last_seen > 10) || 
+                (entry->switch_dpid != dpid || entry->port_no != port_no)) {
+                should_update = true;
+                log_msg(sw, "DEBUG: Updating trunk info with newer trunk info (old port=%d, new port=%d)\n",
+                        entry->port_no, port_no);
+            } else {
+                log_msg(sw, "DEBUG: Not updating - recent trunk info exists and hasn't changed\n");
+            }
+        }
+        /* Case 2c: New info is from trunk port, existing entry is from non-trunk port */
+        else {
+            /* Never overwrite direct connection with trunk info */
+            log_msg(sw, "DEBUG: Not updating - existing direct connection preferred over trunk info\n");
+        }
+        
+        /* Update the entry if our logic determined we should */
+        if (should_update) {
+            log_msg(sw, "DEBUG: Updating MAC %02x:%02x:%02x:%02x:%02x:%02x from switch %016" PRIx64 " port %d to switch %016" PRIx64 " port %d\n",
+                   mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], 
+                   entry->switch_dpid, entry->port_no, dpid, port_no);
+                   
+            entry->switch_dpid = dpid;
+            entry->port_no = port_no;
+            entry->last_seen = time(NULL);
+            entry->is_trunk = is_trunk;
+        }
+    }
 
     pthread_mutex_unlock(&mac_table_lock);
-    log_msg(sw, "MUTEX: Unlocked MAC table\n");
 }
 
 /* find an entry */
 struct mac_entry *find_mac(uint8_t *mac) {
 
-    printf("MUTEX: Locking MAC table\n");
+    // printf("MUTEX: Locking MAC table\n");
     pthread_mutex_lock(&mac_table_lock);
 
     struct mac_entry *entry;
@@ -302,7 +337,7 @@ struct mac_entry *find_mac(uint8_t *mac) {
     }
 
     pthread_mutex_unlock(&mac_table_lock);
-    printf("MUTEX: Unlocked MAC table\n");
+    // printf("MUTEX: Unlocked MAC table\n");
     return entry;
 }
 
@@ -372,7 +407,7 @@ void cleanup_switch(struct switch_info *sw) {
     /* clean up message queue */
    
     /* lock the queue */
-    log_msg(sw, "MUTEX: Locking queue\n");
+    // log_msg(sw, "MUTEX: Locking queue\n");
     pthread_mutex_lock(&sw->queue_lock);
     struct pending_message *current = sw->outgoing_queue;
     while (current) {
@@ -384,7 +419,7 @@ void cleanup_switch(struct switch_info *sw) {
     sw->outgoing_queue = NULL;
 
     pthread_mutex_unlock(&sw->queue_lock);
-    log_msg(sw, "MUTEX: Unlocked queue\n");
+    // log_msg(sw, "MUTEX: Unlocked queue\n");
     pthread_mutex_destroy(&sw->queue_lock);
 
     /* clean up flow table */
@@ -596,7 +631,7 @@ void *accept_handler(void *arg) {
 
         /* find free switch slot */
         printf("Finding free switch slot\n");
-        printf("MUTEX: Locking switches array\n");
+        // printf("MUTEX: Locking switches array\n");
         pthread_mutex_lock(&switches_lock);
         int i;
         for (i = 0; i < MAX_SWITCHES; i++) {
@@ -622,7 +657,7 @@ void *accept_handler(void *arg) {
         }
 
         pthread_mutex_unlock(&switches_lock);
-        printf("MUTEX: Unlocked switches array\n");
+        // printf("MUTEX: Unlocked switches array\n");
 
         
         if (i == MAX_SWITCHES) {
@@ -906,7 +941,7 @@ void queue_openflow_msg(struct switch_info *sw, void *msg, size_t len) {
     new_msg->next = NULL;
     
     /* add to queue */
-    log_msg(sw, "MUTEX: Locking queue\n");
+    // log_msg(sw, "MUTEX: Locking queue\n");
     pthread_mutex_lock(&sw->queue_lock);
     
     if (!sw->outgoing_queue) {
@@ -920,7 +955,7 @@ void queue_openflow_msg(struct switch_info *sw, void *msg, size_t len) {
     }
 
     pthread_mutex_unlock(&sw->queue_lock);
-    log_msg(sw, "MUTEX: Unlocked queue\n");
+    // log_msg(sw, "MUTEX: Unlocked queue\n");
 
     log_msg(sw, "DEBUG: Queued OpenFlow message type=%d, length=%d\n",
             ((struct ofp_header*)msg)->type, ntohs(((struct ofp_header*)msg)->length));
@@ -931,7 +966,7 @@ void process_outgoing_queue(struct switch_info *sw) {
 
     log_msg(sw, "DEBUG: Processing outgoing message queue\n");
 
-    log_msg(sw, "MUTEX: Locking queue\n");
+    // log_msg(sw, "MUTEX: Locking queue\n");
     pthread_mutex_lock(&sw->queue_lock);
     
     struct pending_message *msg = sw->outgoing_queue;
@@ -963,7 +998,7 @@ void process_outgoing_queue(struct switch_info *sw) {
     }
 
     pthread_mutex_unlock(&sw->queue_lock);
-    log_msg(sw, "MUTEX: Unlocked queue\n");
+    // log_msg(sw, "MUTEX: Unlocked queue\n");
 
     log_msg(sw, "DEBUG: Finished processing outgoing message queue\n");
 }
@@ -988,13 +1023,13 @@ void send_hello(struct switch_info *sw) {
 /* handle HELLO message */
 void handle_hello(struct switch_info *sw, struct ofp_header *oh) {
 
-    log_msg(sw, "MUTEX: Locking switch\n");
+    // log_msg(sw, "MUTEX: Locking switch\n");
     pthread_mutex_lock(&sw->lock);
     sw->version = oh->version;
     sw->hello_received = 1;  /* mark HELLO as received */
 
     pthread_mutex_unlock(&sw->lock);
-    log_msg(sw, "MUTEX: Unlocked switch\n");
+   // log_msg(sw, "MUTEX: Unlocked switch\n");
 
 
     log_msg(sw, "Switch hello received, version 0x%02x\n", sw->version);
@@ -1035,7 +1070,7 @@ void send_features_request(struct switch_info *sw) {
 /* handle features reply */
 void handle_features_reply(struct switch_info *sw, struct ofp_switch_features *features) {
 
-    log_msg(sw, "MUTEX: locking switch\n");
+    // log_msg(sw, "MUTEX: locking switch\n");
     pthread_mutex_lock(&sw->lock);
 
     sw->features_received = 1;
@@ -1059,7 +1094,7 @@ void handle_features_reply(struct switch_info *sw, struct ofp_switch_features *f
     log_msg(sw, "  Number of ports: %d\n", num_ports);
 
     pthread_mutex_unlock(&sw->lock);
-    log_msg(sw, "MUTEX: Unlocked switch\n");
+    // log_msg(sw, "MUTEX: Unlocked switch\n");
 
     /* add switch to topology */
     
@@ -1098,14 +1133,14 @@ bool send_echo_request(struct switch_info *sw) {
 void handle_echo_reply(struct switch_info *sw, struct ofp_header *oh) {
     
 
-    log_msg(sw, "MUTEX: Locking switch\n");
+    // log_msg(sw, "MUTEX: Locking switch\n");
     pthread_mutex_lock(&sw->lock);
     /* update both last reply and last echo time */
     sw->last_echo_reply = time(NULL);
     sw->echo_pending = false;  /* Mark that anothe echo can be send, meaning echos have vbeen recienved */
 
     pthread_mutex_unlock(&sw->lock);
-    log_msg(sw, "MUTEX: Unlocked switch\n");
+    // log_msg(sw, "MUTEX: Unlocked switch\n");
     
 }
 
@@ -1130,7 +1165,7 @@ void handle_port_status(struct switch_info *sw, struct ofp_port_status *ps) {
     }
 
 
-    log_msg(sw, "MUTEX: Locking switch\n");
+    // log_msg(sw, "MUTEX: Locking switch\n");
     pthread_mutex_lock(&sw->lock);
 
     
@@ -1138,7 +1173,7 @@ void handle_port_status(struct switch_info *sw, struct ofp_port_status *ps) {
     sw->port_changes++;
 
     pthread_mutex_unlock(&sw->lock);
-    log_msg(sw, "MUTEX: Unlocked switch\n");
+    // log_msg(sw, "MUTEX: Unlocked switch\n");
    
     /* get the port description */
     struct ofp_phy_port *port = &ps->desc;
@@ -1204,12 +1239,12 @@ void handle_packet_in(struct switch_info *sw, struct ofp_packet_in *pi) {
         pi->data[12], pi->data[13]);
 
     /* lock switch for thread safety while accessing switch info */
-    log_msg(sw, "MUTEX: Locking switch\n");
+    // log_msg(sw, "MUTEX: Locking switch\n");
     pthread_mutex_lock(&sw->lock);
     /* increment packet counter */
     sw->packet_in_count++;
     pthread_mutex_unlock(&sw->lock);
-    log_msg(sw, "MUTEX: Unlocked switch\n");
+    // log_msg(sw, "MUTEX: Unlocked switch\n");
 
     /* first check if its a topology discovery packet */
     log_msg(sw, "Checking for topology discovery packet\n");
@@ -1272,13 +1307,13 @@ void handle_unicast_packet(struct switch_info *sw, struct ofp_packet_in *pi, str
     uint16_t in_port = ntohs(pi->in_port);
     
     /* same switch - direct flow */
-    log_msg(sw, "MUTEX: Locking switch\n");
+    // log_msg(sw, "MUTEX: Locking switch\n");
     pthread_mutex_lock(&sw->lock);
     if (sw->datapath_id == dst->switch_dpid) {
 
         /* unlock mutex before other function calls */
         pthread_mutex_unlock(&sw->lock);
-        log_msg(sw, "MUTEX: Unlocked switch\n");
+        // log_msg(sw, "MUTEX: Unlocked switch\n");
 
         log_msg(sw, "Installing direct flow: in_port=%d -> out_port=%d\n", in_port, dst->port_no);
         install_flow(sw, in_port, dst->port_no, ntohl(pi->buffer_id), dst);
@@ -1288,7 +1323,7 @@ void handle_unicast_packet(struct switch_info *sw, struct ofp_packet_in *pi, str
 
     /* unlock mutex before other function calls */
     pthread_mutex_unlock(&sw->lock);
-    log_msg(sw, "MUTEX: Unlocked switch\n");
+    // log_msg(sw, "MUTEX: Unlocked switch\n");
     
     /* different switch - calculate shortest path */
     igraph_integer_t src_vertex = find_vertexid(sw, sw->datapath_id);
@@ -1301,7 +1336,7 @@ void handle_unicast_packet(struct switch_info *sw, struct ofp_packet_in *pi, str
     }
     
     /* find shortest path */
-    log_msg(sw, "MUTEX: Locking topology\n");
+    // log_msg(sw, "MUTEX: Locking topology\n");
     pthread_mutex_lock(&topology.lock);
     igraph_vector_int_t path;
     igraph_vector_int_init(&path, 0);
@@ -1312,14 +1347,14 @@ void handle_unicast_packet(struct switch_info *sw, struct ofp_packet_in *pi, str
 
         /* unlock topology before exit */
         pthread_mutex_unlock(&topology.lock);
-        log_msg(sw, "MUTEX: Unlocked topology\n");
+        // log_msg(sw, "MUTEX: Unlocked topology\n");
 
         return;
     }
 
     /* unlock topology before continue */
     pthread_mutex_unlock(&topology.lock);
-    log_msg(sw, "MUTEX: Unlocked topology\n");
+    // log_msg(sw, "MUTEX: Unlocked topology\n");
     
     /* path should have at least 2 vertices (src and dst) */
     if (igraph_vector_int_size(&path) < 2) {
@@ -1358,7 +1393,7 @@ uint16_t find_port_to_next_hop(struct switch_info *sw, uint64_t src_dpid, uint64
     /* iterate through all edges in the graph */
     log_msg(sw, "Finding port to next hop: src=%016" PRIx64 ", dst=%016" PRIx64 "\n", src_dpid, dst_dpid);
 
-    log_msg(sw, "MUTEX: Locking topology\n");
+    // log_msg(sw, "MUTEX: Locking topology\n");
     pthread_mutex_lock(&topology.lock);
     for (igraph_integer_t i = 0; i < igraph_ecount(&topology.graph); i++) {
         uint64_t edge_src_dpid = (uint64_t)EAN(&topology.graph, "src_dpid", i);
@@ -1368,7 +1403,7 @@ uint16_t find_port_to_next_hop(struct switch_info *sw, uint64_t src_dpid, uint64
             uint16_t port = (uint16_t)EAN(&topology.graph, "src_port", i);
 
             pthread_mutex_unlock(&topology.lock);
-            log_msg(sw, "MUTEX: Unlocked topology\n");
+            // log_msg(sw, "MUTEX: Unlocked topology\n");
             return port;
         }
         
@@ -1376,12 +1411,12 @@ uint16_t find_port_to_next_hop(struct switch_info *sw, uint64_t src_dpid, uint64
             uint16_t port = (uint16_t)EAN(&topology.graph, "dst_port", i);
 
             pthread_mutex_unlock(&topology.lock);
-            log_msg(sw, "MUTEX: Unlocked topology\n");
+            // log_msg(sw, "MUTEX: Unlocked topology\n");
             return port;
         }
     }
     pthread_mutex_unlock(&topology.lock);
-    log_msg(sw, "MUTEX: Unlocked topology\n");
+    // log_msg(sw, "MUTEX: Unlocked topology\n");
     
 
     return OFPP_NONE;  /* not found */
@@ -1392,7 +1427,7 @@ void handle_broadcast_packet(struct switch_info *sw, struct ofp_packet_in *pi, s
     uint64_t switch_dpid = sw->datapath_id;
     
     /* calculate MST (keep this part since it's required) */
-    log_msg(sw, "MUTEX: Locking topology\n");
+    // log_msg(sw, "MUTEX: Locking topology\n");
     pthread_mutex_lock(&topology.lock);
     igraph_vector_int_t mst_edges;
     igraph_vector_int_init(&mst_edges, 0);
@@ -1401,11 +1436,11 @@ void handle_broadcast_packet(struct switch_info *sw, struct ofp_packet_in *pi, s
         log_msg(sw, "ERROR: Failed to calculate MST\n");
         igraph_vector_int_destroy(&mst_edges);
         pthread_mutex_unlock(&topology.lock);
-        log_msg(sw, "MUTEX: Unlocked topology\n");
+        // log_msg(sw, "MUTEX: Unlocked topology\n");
         return;
     }
     pthread_mutex_unlock(&topology.lock);
-    log_msg(sw, "MUTEX: Unlocked topology\n");
+    // log_msg(sw, "MUTEX: Unlocked topology\n");
     
     /* collect all output ports in a single pass */
     uint16_t out_ports[MAX_PORTS_PER_SWITCH];
@@ -1460,7 +1495,7 @@ bool is_port_in_mst(struct switch_info * sw, uint64_t dpid, uint16_t port_no, ig
     igraph_integer_t num_edges = igraph_vector_int_size(mst_edges);
     
     
-    log_msg(sw, "MUTEX: Locking topology\n");
+    // log_msg(sw, "MUTEX: Locking topology\n");
     pthread_mutex_lock(&topology.lock);
     for (igraph_integer_t i = 0; i < num_edges; i++) {
         igraph_integer_t edge_id = VECTOR(*mst_edges)[i];
@@ -1474,13 +1509,13 @@ bool is_port_in_mst(struct switch_info * sw, uint64_t dpid, uint16_t port_no, ig
             (dst_dpid == dpid && dst_port == port_no)) {
 
             pthread_mutex_unlock(&topology.lock);
-            log_msg(sw, "MUTEX: Unlocked topology\n");
+            // log_msg(sw, "MUTEX: Unlocked topology\n");
             return true;
         }
     }
 
     pthread_mutex_unlock(&topology.lock);
-    log_msg(sw, "MUTEX: Unlocked topology\n");
+    // log_msg(sw, "MUTEX: Unlocked topology\n");
     
 
     return false;
