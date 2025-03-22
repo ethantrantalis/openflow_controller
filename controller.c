@@ -68,7 +68,7 @@
 #include <sys/time.h>
 #include <time.h>
 #include <fcntl.h>
-#include </opt/homebrew/Cellar/igraph/0.10.15_1/include/igraph/igraph.h>
+#include </usr/include/igraph/igraph.h>
 #include "headers/uthash.h"
 
 #if defined(__linux__)
@@ -95,6 +95,7 @@ volatile int running = 1; /* for controller clean up and running */
 struct network_topology topology;
 
 
+#define MESSAGE_QUEUE_TIMEOUT 5  /* 5 seconds timeout for queued messages */
 
 /* ---------------------------------------------------- FLOW TABLE ------------------------------------------------- */
 
@@ -238,21 +239,21 @@ struct mac_entry *mac_table = NULL;
 pthread_mutex_t mac_table_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* add or update an entry */
-void add_or_update_mac(struct switch_info *sw, uint8_t *mac, uint64_t dpid, uint16_t port_no) {
-    /* First determine if this port is a trunk port */
+void add_or_update_mac(struct switch_info *sw, uint8_t *mac, uint64_t dpid, uint16_t port_no, bool is_infrastructure) {
+    /* first determine if this port is a trunk port */
     bool is_trunk = is_trunk_port(sw, dpid, port_no);
 
-    log_msg(sw, "DEBUG: Adding or updating MAC %02x:%02x:%02x:%02x:%02x:%02x from switch %016" PRIx64 " port %d (is_trunk=%d)\n",
-            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], dpid, port_no, is_trunk);
+    log_msg(sw, "DEBUG: Adding or updating MAC %02x:%02x:%02x:%02x:%02x:%02x from switch %016" PRIx64 " port %d (is_trunk=%d, is_infrastructure=%d)\n",
+            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], dpid, port_no, is_trunk, is_infrastructure);
 
     pthread_mutex_lock(&mac_table_lock);
 
     struct mac_entry *entry;
     
-    /* Look up existing entry */
+    /* look up existing entry */
     HASH_FIND(hh, mac_table, mac, MAC_ADDR_LEN, entry);
     
-    /* Case 1: No existing entry - always add new entry regardless of trunk status */
+    /* no existing entry - always add new entry regardless of trunk status */
     if (entry == NULL) {
         entry = malloc(sizeof(struct mac_entry));
         if (!entry) {
@@ -266,42 +267,56 @@ void add_or_update_mac(struct switch_info *sw, uint8_t *mac, uint64_t dpid, uint
         entry->port_no = port_no;
         entry->last_seen = time(NULL);
         entry->is_trunk = is_trunk;
+        entry->is_infrastructure = is_infrastructure;
         HASH_ADD(hh, mac_table, mac, MAC_ADDR_LEN, entry);
         
-        log_msg(sw, "DEBUG: Added new MAC %02x:%02x:%02x:%02x:%02x:%02x to table for switch %016" PRIx64 " port %d (is_trunk=%d)\n",
-                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], dpid, port_no, is_trunk);
+        log_msg(sw, "DEBUG: Added new MAC %02x:%02x:%02x:%02x:%02x:%02x to table for switch %016" PRIx64 " port %d (is_trunk=%d, is_infrastructure=%d)\n",
+                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], dpid, port_no, is_trunk, is_infrastructure);
     }
-    /* Case 2: Existing entry - need to decide whether to update */
+    /* existing entry - need to decide whether to update */
     else {
         bool should_update = false;
         
-        /* Case 2a: New info is from non-trunk port (direct connection) */
-        if (!is_trunk) {
-            /* Always prefer direct connections */
-            should_update = true;
-            log_msg(sw, "DEBUG: Updating MAC with direct connection (old is_trunk=%d, new is_trunk=%d)\n", 
-                    entry->is_trunk, is_trunk);
+        /* never update infrastructure entries with non-infrastructure entries */
+        if (entry->is_infrastructure && !is_infrastructure) {
+            log_msg(sw, "DEBUG: Not updating - existing entry is infrastructure, new is not\n");
         }
-        /* Case 2b: New info is from trunk port, existing entry is from trunk port */
-        else if (entry->is_trunk) {
-            /* Update if the existing trunk entry is old or if trunk port has changed */
-            time_t current_time = time(NULL);
-            if ((current_time - entry->last_seen > 10) || 
-                (entry->switch_dpid != dpid || entry->port_no != port_no)) {
+        /* for infrastructure entries, always update with newer infrastructure info */
+        else if (is_infrastructure) {
+            should_update = true;
+            log_msg(sw, "DEBUG: Updating with new infrastructure info\n");
+        }
+        /* Ffor non-infrastructure entries, use the existing trunk port logic */
+        else {
+            /* new info is from non-trunk port (direct connection) */
+            if (!is_trunk) {
+                /* Always prefer direct connections */
                 should_update = true;
-                log_msg(sw, "DEBUG: Updating trunk info with newer trunk info (old port=%d, new port=%d)\n",
-                        entry->port_no, port_no);
-            } else {
-                log_msg(sw, "DEBUG: Not updating - recent trunk info exists and hasn't changed\n");
+                log_msg(sw, "DEBUG: Updating MAC with direct connection (old is_trunk=%d, new is_trunk=%d)\n", 
+                        entry->is_trunk, is_trunk);
+            }
+            /* new info is from trunk port, existing entry is from trunk port */
+            else if (entry->is_trunk) {
+                /* update if the existing trunk entry is old or if trunk port has changed */
+                time_t current_time = time(NULL);
+                
+                if ((current_time - entry->last_seen > 5) || 
+                    (entry->switch_dpid != dpid || entry->port_no != port_no)) {
+                    should_update = true;
+                    log_msg(sw, "DEBUG: Updating trunk info with newer trunk info (old port=%d, new port=%d)\n",
+                            entry->port_no, port_no);
+                } else {
+                    log_msg(sw, "DEBUG: Not updating - recent trunk info exists and hasn't changed\n");
+                }
+            }
+            /* new info is from trunk port, existing entry is from non-trunk port */
+            else {
+                /* never overwrite direct connection with trunk info */
+                log_msg(sw, "DEBUG: Not updating - existing direct connection preferred over trunk info\n");
             }
         }
-        /* Case 2c: New info is from trunk port, existing entry is from non-trunk port */
-        else {
-            /* Never overwrite direct connection with trunk info */
-            log_msg(sw, "DEBUG: Not updating - existing direct connection preferred over trunk info\n");
-        }
         
-        /* Update the entry if our logic determined we should */
+        /* update the entry if our logic determined we should */
         if (should_update) {
             log_msg(sw, "DEBUG: Updating MAC %02x:%02x:%02x:%02x:%02x:%02x from switch %016" PRIx64 " port %d to switch %016" PRIx64 " port %d\n",
                    mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], 
@@ -311,6 +326,11 @@ void add_or_update_mac(struct switch_info *sw, uint8_t *mac, uint64_t dpid, uint
             entry->port_no = port_no;
             entry->last_seen = time(NULL);
             entry->is_trunk = is_trunk;
+            
+            /* only update the infrastructure flag if we're explicitly setting it to true */
+            if (is_infrastructure) {
+                entry->is_infrastructure = true;
+            }
         }
     }
 
@@ -339,6 +359,35 @@ struct mac_entry *find_mac(uint8_t *mac) {
     pthread_mutex_unlock(&mac_table_lock);
     // printf("MUTEX: Unlocked MAC table\n");
     return entry;
+}
+
+/* fnction to clean up the MAC table */
+void cleanup_mac_table() {
+    struct mac_entry *current, *tmp;
+    
+    pthread_mutex_lock(&mac_table_lock);
+    HASH_ITER(hh, mac_table, current, tmp) {
+        HASH_DEL(mac_table, current);
+        free(current);
+    }
+    pthread_mutex_unlock(&mac_table_lock);
+}
+
+/* remove MAC entries older than MAC_ENTRY_TIMEOUT seconds */
+void prune_mac_table() {
+    struct mac_entry *current, *tmp;
+    time_t current_time = time(NULL);
+    
+    pthread_mutex_lock(&mac_table_lock);
+    HASH_ITER(hh, mac_table, current, tmp) {
+        /* Skip infrastructure entries which are permanent */
+        if (!current->is_infrastructure && 
+            (current_time - current->last_seen > MAC_ENTRY_TIMEOUT)) {
+            HASH_DEL(mac_table, current);
+            free(current);
+        }
+    }
+    pthread_mutex_unlock(&mac_table_lock);
 }
 
 /* ---------------------------------------------------- HELPERS ---------------------------------------------------- */
@@ -382,32 +431,29 @@ void log_msg(struct switch_info * sw, const char *format, ...) {
 
 /* clean up function for threads and and switches*/
 void cleanup_switch(struct switch_info *sw) {
-
     /* remove from topology first */
     handle_switch_disconnect(sw);
     printf("Cleaning up switch %016" PRIx64 " from topology\n", sw->datapath_id);
 
-
-    log_msg(sw, "Locking switch\n");
     pthread_mutex_lock(&sw->lock);
 
     if (sw->active) {
         sw->active = 0;
         close(sw->socket);
-        free(sw->ports);
-        sw->ports = NULL;
+        
+        /* free port information */
+        if (sw->ports) {
+            free(sw->ports);
+            sw->ports = NULL;
+        }
         sw->num_ports = 0;
         sw->hello_received = 0;
         sw->features_received = 0;
     }
 
     pthread_mutex_unlock(&sw->lock);
-    log_msg(sw, "Unlocked switch\n");
-
-    /* clean up message queue */
-   
-    /* lock the queue */
-    // log_msg(sw, "MUTEX: Locking queue\n");
+    
+    /* Ccean up message queue */
     pthread_mutex_lock(&sw->queue_lock);
     struct pending_message *current = sw->outgoing_queue;
     while (current) {
@@ -417,16 +463,34 @@ void cleanup_switch(struct switch_info *sw) {
         current = next;
     }
     sw->outgoing_queue = NULL;
-
     pthread_mutex_unlock(&sw->queue_lock);
-    // log_msg(sw, "MUTEX: Unlocked queue\n");
     pthread_mutex_destroy(&sw->queue_lock);
 
-    /* clean up flow table */
-
+    /* clean up flow table - properly free all entries */
+    pthread_mutex_lock(&sw->flow_table_lock);
+    /* no need to free individual entries since we're freeing the whole table */
     free(sw->flow_table);
-
+    sw->flow_table = NULL;
+    sw->num_flows = 0;
+    pthread_mutex_unlock(&sw->flow_table_lock);
     pthread_mutex_destroy(&sw->flow_table_lock);
+    
+    /* remove this switch's MAC entries */
+    remove_switch_mac_entries(sw->datapath_id);
+}
+
+/* function to remove MAC entries for a specific switch */
+void remove_switch_mac_entries(uint64_t dpid) {
+    struct mac_entry *current, *tmp;
+    
+    pthread_mutex_lock(&mac_table_lock);
+    HASH_ITER(hh, mac_table, current, tmp) {
+        if (current->switch_dpid == dpid) {
+            HASH_DEL(mac_table, current);
+            free(current);
+        }
+    }
+    pthread_mutex_unlock(&mac_table_lock);
 }
 
 /* ------------------------------------------------------ MAIN ----------------------------------------------------- */
@@ -437,8 +501,6 @@ int main(int argc, char *argv[]) {
     
     /* handle command line args for port number */
     if (argc > 1) {
-
-        /* convert second arg to int for port from user */
         port = atoi(argv[1]);
     }
     
@@ -451,41 +513,48 @@ int main(int argc, char *argv[]) {
     /* initialize controller */
     init_controller(port);
     
-    /* main loop - just wait for shutdown signal */
+    /* Add periodic maintenance tasks */
+    time_t last_maintenance = time(NULL);
+    
+    /* Main loop - wait for shutdown signal or perform maintenance */
     while (running) {
+        time_t now = time(NULL);
+        
+        /* Perform maintenance every 60 seconds */
+        if (now - last_maintenance > 60) {
+            prune_mac_table();
+            last_maintenance = now;
+        }
+        
         sleep(1);
     }
     
-    /* cleanup threads */
+    /* Cleanup threads and switches */
     int i;
     for (i = 0; i < MAX_SWITCHES; i++) {
-        
-
         if (switches[i].active) {
             switches[i].active = 0;
             close(switches[i].socket);
-            if(switches[i].ports){
-                free(switches[i].ports);
-            }
-
+            cleanup_switch(&switches[i]);
         }
-
         pthread_mutex_destroy(&switches[i].lock);
     }
 
-    /* clean global topology structure */
-
-    igraph_destroy(&topology.graph);
-    pthread_mutex_destroy(&topology.lock);
+    /* Clean global topology structure */
+    cleanup_topology();
     
-    /* close server socket */
+    /* Clean up MAC table */
+    cleanup_mac_table();
+    
+    /* Close server socket */
     close(server_socket);
     
-    /* destroy global mutex */
+    /* Destroy global mutex */
     pthread_mutex_destroy(&switches_lock);
+    pthread_mutex_destroy(&mac_table_lock);
+    
     return 0;
 }
-
 /* initialize controller */
 void init_controller(int port) {
 
@@ -816,9 +885,6 @@ void *switch_handler(void *arg) {
 /* handle incoming OpenFlow message, see while loop in switch handler */
 void handle_switch_message(struct switch_info *sw, uint8_t *msg, size_t len) {
     struct ofp_header *oh = (struct ofp_header *)msg;
-
-    log_msg(sw, "DEBUG: Received message type=%d, length=%d, xid=%u\n", 
-        oh->type, ntohs(oh->length), ntohl(oh->xid));
     
     /* verify message length */
     if (len < sizeof(*oh)) {
@@ -919,7 +985,70 @@ void handle_switch_message(struct switch_info *sw, uint8_t *msg, size_t len) {
 
 /* ------------------------------------------------- MESSAGE QUEUE ------------------------------------------------- */
 
-/* default function for sending OpenFlow message */
+/* Add this to controller.h */
+#define MESSAGE_QUEUE_TIMEOUT 5  /* 5 seconds timeout for queued messages */
+
+/* Improve process_outgoing_queue to handle timeouts */
+void process_outgoing_queue(struct switch_info *sw) {
+    pthread_mutex_lock(&sw->queue_lock);
+    
+    time_t current_time = time(NULL);
+    struct pending_message *msg = sw->outgoing_queue;
+    struct pending_message *prev = NULL;
+    
+    while (msg) {
+        struct pending_message *next = msg->next;
+        
+        /* Check if message has timed out */
+        if (current_time - msg->creation_time > MESSAGE_QUEUE_TIMEOUT) {
+            /* Remove timed out message */
+            if (prev) {
+                prev->next = next;
+            } else {
+                sw->outgoing_queue = next;
+            }
+            free(msg->data);
+            free(msg);
+            msg = next;
+            continue;
+        }
+        
+        if (sw->active) {
+            ssize_t sent = send(sw->socket, 
+                             (char*)msg->data + msg->sent, 
+                             msg->length - msg->sent, 
+                             MSG_DONTWAIT);
+            
+            if (sent > 0) {
+                msg->sent += sent;
+                
+                /* Message fully sent */
+                if (msg->sent >= msg->length) {
+                    if (prev) {
+                        prev->next = next;
+                    } else {
+                        sw->outgoing_queue = next;
+                    }
+                    free(msg->data);
+                    free(msg);
+                    msg = next;
+                    continue;
+                }
+            } else if (sent < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                log_msg(sw, "ERROR: Failed to send message: %s\n", strerror(errno));
+                sw->active = 0;  /* Mark for disconnection */
+                break;
+            }
+        }
+        
+        prev = msg;
+        msg = next;
+    }
+
+    pthread_mutex_unlock(&sw->queue_lock);
+}
+
+/* Update the queue_openflow_msg function to add creation time */
 void queue_openflow_msg(struct switch_info *sw, void *msg, size_t len) {
     struct pending_message *new_msg = malloc(sizeof(struct pending_message));
     if (!new_msg) {
@@ -927,7 +1056,7 @@ void queue_openflow_msg(struct switch_info *sw, void *msg, size_t len) {
         return;
     }
     
-    /* make a copy of the message data */
+    /* Make a copy of the message data */
     new_msg->data = malloc(len);
     if (!new_msg->data) {
         free(new_msg);
@@ -938,10 +1067,10 @@ void queue_openflow_msg(struct switch_info *sw, void *msg, size_t len) {
     memcpy(new_msg->data, msg, len);
     new_msg->length = len;
     new_msg->sent = 0;
+    new_msg->creation_time = time(NULL);  /* Add creation timestamp */
     new_msg->next = NULL;
     
-    /* add to queue */
-    // log_msg(sw, "MUTEX: Locking queue\n");
+    /* Add to queue */
     pthread_mutex_lock(&sw->queue_lock);
     
     if (!sw->outgoing_queue) {
@@ -955,52 +1084,6 @@ void queue_openflow_msg(struct switch_info *sw, void *msg, size_t len) {
     }
 
     pthread_mutex_unlock(&sw->queue_lock);
-    // log_msg(sw, "MUTEX: Unlocked queue\n");
-
-    log_msg(sw, "DEBUG: Queued OpenFlow message type=%d, length=%d\n",
-            ((struct ofp_header*)msg)->type, ntohs(((struct ofp_header*)msg)->length));
-}
-
-/* function for single point of processing messages at once */
-void process_outgoing_queue(struct switch_info *sw) {
-
-    log_msg(sw, "DEBUG: Processing outgoing message queue\n");
-
-    // log_msg(sw, "MUTEX: Locking queue\n");
-    pthread_mutex_lock(&sw->queue_lock);
-    
-    struct pending_message *msg = sw->outgoing_queue;
-    if (!msg) {
-
-        return;
-    }
-    
-    if (sw->active) {
-        ssize_t sent = send(sw->socket, 
-                          (char*)msg->data + msg->sent, 
-                          msg->length - msg->sent, 
-                          MSG_DONTWAIT);
-        
-        if (sent > 0) {
-            msg->sent += sent;
-            
-            /* message fully sent */
-            if (msg->sent >= msg->length) {
-                sw->outgoing_queue = msg->next;
-                free(msg->data);
-                free(msg);
-                log_msg(sw, "DEBUG: OpenFlow message fully sent\n");
-            }
-        } else if (sent < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-            log_msg(sw, "ERROR: Failed to send message: %s\n", strerror(errno));
-            sw->active = 0;  /* mark for disconnection */
-        }
-    }
-
-    pthread_mutex_unlock(&sw->queue_lock);
-    // log_msg(sw, "MUTEX: Unlocked queue\n");
-
-    log_msg(sw, "DEBUG: Finished processing outgoing message queue\n");
 }
 
 /* ------------------------------------------------------ HELLO ---------------------------------------------------- */
@@ -1247,10 +1330,8 @@ void handle_packet_in(struct switch_info *sw, struct ofp_packet_in *pi) {
     // log_msg(sw, "MUTEX: Unlocked switch\n");
 
     /* first check if its a topology discovery packet */
-    log_msg(sw, "Checking for topology discovery packet\n");
     if(is_topology_discovery_packet(pi->data, ntohs(pi->total_len))) {
         handle_discovery_packet(sw, pi);
-        log_msg(sw, "Topology discovery packet received from switch \n");
 
         return; /* return succesfully */
     }
@@ -1258,8 +1339,6 @@ void handle_packet_in(struct switch_info *sw, struct ofp_packet_in *pi) {
     /* extract basic packet information */
     uint16_t in_port = ntohs(pi->in_port);
 
-    log_msg(sw, "This is a regular packet in (not discovery)\n");
-    log_msg(sw, "Preparing to insall flow\n");
     /* extract information used for the flow resulting from this packet */
     uint8_t *eth_frame = pi->data;
     uint8_t *dst_mac = eth_frame + ETH_DST_OFFSET;
@@ -1270,7 +1349,22 @@ void handle_packet_in(struct switch_info *sw, struct ofp_packet_in *pi) {
         src_mac[0], src_mac[1], src_mac[2], src_mac[3], src_mac[4], src_mac[5], in_port);
 
     /* add or update source mac to mac table */
-    add_or_update_mac(sw, src_mac, sw->datapath_id, in_port);
+    // When learning a MAC address
+   
+
+    struct mac_entry *existing = find_mac(src_mac);
+
+    if (!existing) {
+        // This MAC wasn't pre-populated, so it's likely a host
+        add_or_update_mac(sw, src_mac, sw->datapath_id, in_port, false);
+        log_msg(sw, "Learned new host MAC %02x:%02x:%02x:%02x:%02x:%02x on switch %016" PRIx64 " port %d\n",
+                src_mac[0], src_mac[1], src_mac[2], src_mac[3], src_mac[4], src_mac[5], 
+                sw->datapath_id, in_port);
+    } else if (!existing->is_infrastructure) {
+        // Update existing host entry
+        add_or_update_mac(sw, src_mac, sw->datapath_id, in_port, false);
+    }
+    pthread_mutex_unlock(&mac_table_lock);
 
     /* case for OFPR_ACTION */
     static const uint8_t BROADCAST_MAC[MAC_ADDR_LEN] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
@@ -1302,87 +1396,328 @@ void handle_packet_in(struct switch_info *sw, struct ofp_packet_in *pi) {
 }
 
 /* --------------------------------------------- ROUTING/FLOW INSTALLATION ----------------------------------------- */
+/*
+ * Validates that a path is valid before installing flows.
+ * Returns true if the path is valid, false otherwise.
+ */
+bool validate_path(uint64_t src_dpid, uint16_t src_port, 
+                   uint64_t dst_dpid, uint16_t dst_port,
+                   uint64_t *switch_dpids, uint16_t *ingress_ports, 
+                   uint16_t *egress_ports, int num_hops, struct switch_info *sw) {
+    
+    /* validate source/destination ports aren't the same on the same switch */
+    if (src_dpid == dst_dpid && src_port == dst_port) {
+        log_msg(NULL, "ERROR: Path validation failed - same in/out port (%d) on switch %016" PRIx64 "\n", 
+                src_port, src_dpid);
+        return false;
+    }
+    
+    /* Validate first switch is source and last is destination */
+    if (switch_dpids[0] != src_dpid || switch_dpids[num_hops] != dst_dpid) {
+        log_msg(NULL, "ERROR: Path validation failed - endpoints don't match expected source/destination\n");
+        log_msg(NULL, "       Expected: [%016" PRIx64 ", ..., %016" PRIx64 "]\n", 
+            src_dpid, dst_dpid);
+        log_msg(NULL, "       Got: [%016" PRIx64 ", ..., %016" PRIx64 "]\n", 
+            switch_dpids[0], switch_dpids[num_hops]);
+        return false;
+        }
+    
+    // Check for loops in the path
+    for (int i = 0; i < num_hops; i++) {
+        // Validate that in_port != out_port for each switch (no hairpinning)
+        if (ingress_ports[i] == egress_ports[i]) {
+            log_msg(NULL, "ERROR: Path validation failed - switch %016" PRIx64 " has same in/out port\n", 
+                    switch_dpids[i]);
+            return false;
+        }
+        
+        // Check for repeated switches in path (except for the first and last)
+        for (int j = i+1; j < num_hops; j++) {
+            if (switch_dpids[i] == switch_dpids[j] && !(i == 0 && j == num_hops)) {
+                log_msg(NULL, "ERROR: Path validation failed - switch %016" PRIx64 " appears multiple times\n", 
+                        switch_dpids[i]);
+                return false;
+            }
+        }
+    }
+    
+    // Validate connectivity between adjacent switches
+    pthread_mutex_lock(&topology.lock);
+    for (int i = 0; i < num_hops; i++) {
+        igraph_integer_t v1 = find_vertexid(sw, switch_dpids[i]);
+        igraph_integer_t v2 = find_vertexid(sw, switch_dpids[i+1]);
+        
+        if (v1 < 0 || v2 < 0) {
+            pthread_mutex_unlock(&topology.lock);
+            log_msg(NULL, "ERROR: Path validation failed - switch not found in topology\n");
+            return false;
+        }
+        
+        igraph_integer_t eid;
+        igraph_get_eid(&topology.graph, &eid, v1, v2, IGRAPH_ALL, 0);
+        if (eid < 0) {
+            pthread_mutex_unlock(&topology.lock);
+            log_msg(NULL, "ERROR: Path validation failed - no link between switches %016" PRIx64 " and %016" PRIx64 "\n", 
+                    switch_dpids[i], switch_dpids[i+1]);
+            return false;
+        }
+    }
+    pthread_mutex_unlock(&topology.lock);
+    
+    return true; // Path is valid
+}
 
 void handle_unicast_packet(struct switch_info *sw, struct ofp_packet_in *pi, struct mac_entry *dst) {
     uint16_t in_port = ntohs(pi->in_port);
     
-    /* same switch - direct flow */
-    // log_msg(sw, "MUTEX: Locking switch\n");
+    // Extract source MAC for reverse path
+    uint8_t *eth_frame = pi->data;
+    uint8_t *src_mac = eth_frame + ETH_SRC_OFFSET;
+    
+    // Find source MAC entry for reverse path installation
+    struct mac_entry *src_entry = find_mac(src_mac);
+    if (!src_entry) {
+        log_msg(sw, "WARNING: Source MAC entry not found, cannot install reverse path\n");
+        // Continue with one-way path installation
+    }
+    
+    // Same switch case
     pthread_mutex_lock(&sw->lock);
     if (sw->datapath_id == dst->switch_dpid) {
-
-        /* unlock mutex before other function calls */
         pthread_mutex_unlock(&sw->lock);
-        // log_msg(sw, "MUTEX: Unlocked switch\n");
-
-        log_msg(sw, "Installing direct flow: in_port=%d -> out_port=%d\n", in_port, dst->port_no);
+        
+        // NEW: Check if destination port equals ingress port (special case)
+        if (in_port == dst->port_no) {
+            log_msg(sw, "INFO: Source and destination are on the same port (%d). No flow needed.\n", in_port);
+            // Just send the packet without installing any flows
+            send_packet_out(sw, in_port, dst->port_no, ntohl(pi->buffer_id), pi->data, ntohs(pi->total_len));
+            return;
+        }
+        
+        // Install forward flow
         install_flow(sw, in_port, dst->port_no, ntohl(pi->buffer_id), dst);
+        
+        // If we have the source entry, install reverse flow too
+        if (src_entry) {
+            install_flow(sw, dst->port_no, in_port, 0xFFFFFFFF, src_entry);
+            log_msg(sw, "Installed reverse flow on same switch: out_port=%d -> in_port=%d\n", 
+                   dst->port_no, in_port);
+        }
+        
         send_packet_out(sw, in_port, dst->port_no, pi->buffer_id, pi->data, ntohs(pi->total_len));
         return;
     }
-
-    /* unlock mutex before other function calls */
     pthread_mutex_unlock(&sw->lock);
-    // log_msg(sw, "MUTEX: Unlocked switch\n");
     
-    /* different switch - calculate shortest path */
+    // Different switch - calculate shortest path
     igraph_integer_t src_vertex = find_vertexid(sw, sw->datapath_id);
     igraph_integer_t dst_vertex = find_vertexid(sw, dst->switch_dpid);
     
     if (src_vertex < 0 || dst_vertex < 0) {
         log_msg(sw, "ERROR: Can't find vertices for path calculation\n");
-
         return;
     }
     
-    /* find shortest path */
-    // log_msg(sw, "MUTEX: Locking topology\n");
+    // Find the shortest path
     pthread_mutex_lock(&topology.lock);
     igraph_vector_int_t path;
     igraph_vector_int_init(&path, 0);
     
-    if (igraph_get_shortest_path_dijkstra(&topology.graph, &path, NULL, src_vertex, dst_vertex, NULL, IGRAPH_ALL) != IGRAPH_SUCCESS) {
+    // NEW: Create and initialize weight vector for consistent path selection
+    igraph_vector_t weights;
+    igraph_vector_init(&weights, igraph_ecount(&topology.graph));
+    
+    // Fill weights vector from edge attributes
+    for (igraph_integer_t i = 0; i < igraph_ecount(&topology.graph); i++) {
+        VECTOR(weights)[i] = EAN(&topology.graph, "weight", i);
+        log_msg(sw, "DEBUG: Edge %lld weight: %f\n", i, VECTOR(weights)[i]);
+    }
+    
+    // Use weights in the Dijkstra call
+    if (igraph_get_shortest_path_dijkstra(&topology.graph, &path, NULL, 
+                                         src_vertex, dst_vertex, 
+                                         &weights, IGRAPH_ALL) != IGRAPH_SUCCESS) {
         log_msg(sw, "ERROR: Failed to calculate path\n");
+        igraph_vector_destroy(&weights);
         igraph_vector_int_destroy(&path);
-
-        /* unlock topology before exit */
         pthread_mutex_unlock(&topology.lock);
-        // log_msg(sw, "MUTEX: Unlocked topology\n");
-
         return;
     }
-
-    /* unlock topology before continue */
-    pthread_mutex_unlock(&topology.lock);
-    // log_msg(sw, "MUTEX: Unlocked topology\n");
     
-    /* path should have at least 2 vertices (src and dst) */
+    igraph_vector_destroy(&weights);
+    pthread_mutex_unlock(&topology.lock);
+    
+    // Path should have at least 2 vertices (src and dst)
     if (igraph_vector_int_size(&path) < 2) {
         log_msg(sw, "ERROR: Path too short\n");
         igraph_vector_int_destroy(&path);
-
         return;
     }
     
-    /* get next hop info */
-    igraph_integer_t next_hop_vertex = VECTOR(path)[1];  // Second vertex in path
-    uint64_t next_hop_dpid = vertex_to_dpid(next_hop_vertex, sw);
+    // Store the path information for validation and reverse path installation
+    int path_length = igraph_vector_int_size(&path);
+    uint64_t switch_dpids[path_length];
+    uint16_t ingress_ports[path_length];
+    uint16_t egress_ports[path_length];
     
-    /* find the out_port connecting to next hop */
-    uint16_t out_port = find_port_to_next_hop(sw, sw->datapath_id, next_hop_dpid);
+    log_msg(sw, "Installing flows along path with %d switches\n", path_length);
     
-    if (out_port == OFPP_NONE) {
-        log_msg(sw, "ERROR: Can't find port to next hop\n");
+    // At the first switch (source), use the ingress port from the packet_in
+    uint16_t current_in_port = in_port;
+    
+    // For each pair of switches in the path, store DPID and port info
+    for (int i = 0; i < path_length; i++) {
+        igraph_integer_t current_vertex = VECTOR(path)[i];
+        switch_dpids[i] = vertex_to_dpid(current_vertex, sw);
+        
+        if (i == 0) {
+            // First switch ingress comes from the packet_in
+            ingress_ports[i] = current_in_port;
+        }
+        else if (i < path_length - 1) {
+            // Find ingress port on internal switches
+            ingress_ports[i] = find_ingress_port(sw, switch_dpids[i], switch_dpids[i-1]);
+        }
+        
+        if (i < path_length - 1) {
+            // Find egress port for all but the last switch
+            egress_ports[i] = find_port_to_next_hop(sw, switch_dpids[i], switch_dpids[i+1]);
+        }
+    }
+    
+    // For the last switch, egress is to the destination host
+    egress_ports[path_length-1] = dst->port_no;
+    
+    // NEW: Validate the path before installing flows
+    if (!validate_path(sw->datapath_id, in_port, dst->switch_dpid, dst->port_no,
+                      switch_dpids, ingress_ports, egress_ports, path_length-1, sw)) {
+        log_msg(sw, "ERROR: Path validation failed, not installing flows\n");
         igraph_vector_int_destroy(&path);
         return;
     }
     
-    /* install flow and send packet */
-    log_msg(sw, "Installing next-hop flow: in_port=%d -> out_port=%d (next hop: %016" PRIx64 ")\n", 
-           in_port, out_port, next_hop_dpid);
+    // For each pair of switches in the path - Forward direction
+    for (int i = 0; i < path_length - 1; i++) {
+        igraph_integer_t current_vertex = VECTOR(path)[i];
+        igraph_integer_t next_vertex = VECTOR(path)[i+1];
+        
+        uint64_t current_dpid = vertex_to_dpid(current_vertex, sw);
+        uint64_t next_dpid = vertex_to_dpid(next_vertex, sw);
+        
+        // Find the port from current switch to next switch
+        uint16_t out_port = find_port_to_next_hop(sw, current_dpid, next_dpid);
+        
+        if (out_port == OFPP_NONE) {
+            log_msg(sw, "ERROR: Can't find port from switch %016" PRIx64 " to switch %016" PRIx64 "\n", 
+                   current_dpid, next_dpid);
+            igraph_vector_int_destroy(&path);
+            return;
+        }
+        
+        // Find the switch_info structure for the current switch
+        struct switch_info *current_sw = find_switch_by_dpid(current_dpid);
+        
+        if (current_sw) {
+            // Install forward flow
+            log_msg(sw, "Installing flow at switch %016" PRIx64 ": in_port=%d -> out_port=%d for dst_mac=%02x:%02x:%02x:%02x:%02x:%02x\n", 
+                   current_dpid, current_in_port, out_port,
+                   dst->mac[0], dst->mac[1], dst->mac[2], dst->mac[3], dst->mac[4], dst->mac[5]);
+            
+            // If this is the source switch, use the buffer_id for packet_out
+            uint32_t buffer = (i == 0) ? ntohl(pi->buffer_id) : 0xFFFFFFFF;
+            
+            install_flow(current_sw, current_in_port, out_port, buffer, dst);
+            
+            // Only send the packet_out from the source switch
+            if (i == 0) {
+                send_packet_out(current_sw, current_in_port, out_port, pi->buffer_id, pi->data, ntohs(pi->total_len));
+            }
+        } else {
+            log_msg(sw, "WARNING: Could not find switch %016" PRIx64 " to install flow\n", current_dpid);
+        }
+        
+        // If not the last iteration, find the in_port for the next switch
+        if (i < path_length - 2) {
+            // Find ingress port on the next switch from the current switch
+            current_in_port = find_ingress_port(sw, next_dpid, current_dpid);
+            
+            if (current_in_port == 0) {
+                log_msg(sw, "ERROR: Can't find ingress port on switch %016" PRIx64 " from switch %016" PRIx64 "\n", 
+                       next_dpid, current_dpid);
+                igraph_vector_int_destroy(&path);
+                return;
+            }
+        }
+    }
     
-    install_flow(sw, in_port, out_port, ntohl(pi->buffer_id), dst);
-    send_packet_out(sw, in_port, out_port, pi->buffer_id, pi->data, ntohs(pi->total_len));
+    // Handle the last switch (destination switch)
+    igraph_integer_t last_vertex = VECTOR(path)[path_length - 1];
+    uint64_t last_dpid = vertex_to_dpid(last_vertex, sw);
+    
+    // Find the switch_info structure for the destination switch
+    struct switch_info *dst_sw = find_switch_by_dpid(last_dpid);
+    
+    if (dst_sw) {
+        log_msg(sw, "Installing final flow at destination switch %016" PRIx64 ": in_port=%d -> out_port=%d for dst_mac=%02x:%02x:%02x:%02x:%02x:%02x\n", 
+               last_dpid, current_in_port, dst->port_no,
+               dst->mac[0], dst->mac[1], dst->mac[2], dst->mac[3], dst->mac[4], dst->mac[5]);
+        
+        // Double check we're not creating a looping flow
+        if (current_in_port != dst->port_no) {
+            install_flow(dst_sw, current_in_port, dst->port_no, 0xFFFFFFFF, dst);
+        } else {
+            log_msg(sw, "WARNING: Avoided installing looping flow on destination switch\n");
+        }
+    } else {
+        log_msg(sw, "WARNING: Could not find destination switch %016" PRIx64 " to install flow\n", last_dpid);
+    }
+    
+    // Now install reverse path flows if we have the source entry
+    if (src_entry) {
+        log_msg(sw, "Installing reverse path flows\n");
+        
+        // Install flows in reverse order
+        for (int i = path_length - 1; i > 0; i--) {
+            struct switch_info *current_sw = find_switch_by_dpid(switch_dpids[i]);
+            if (current_sw) {
+                // For the destination switch, the in_port is the host port and out_port is the trunk
+                // For intermediate switches, both are trunk ports
+                uint16_t rev_in_port = (i == path_length - 1) ? dst->port_no : egress_ports[i];
+                uint16_t rev_out_port = ingress_ports[i];
+                
+                // Double check we're not creating a looping flow
+                if (rev_in_port != rev_out_port) {
+                    log_msg(sw, "Installing reverse flow at switch %016" PRIx64 ": in_port=%d -> out_port=%d for src_mac=%02x:%02x:%02x:%02x:%02x:%02x\n", 
+                           switch_dpids[i], rev_in_port, rev_out_port,
+                           src_mac[0], src_mac[1], src_mac[2], src_mac[3], src_mac[4], src_mac[5]);
+                    
+                    install_flow(current_sw, rev_in_port, rev_out_port, 0xFFFFFFFF, src_entry);
+                } else {
+                    log_msg(sw, "WARNING: Avoided installing looping reverse flow on switch %016" PRIx64 "\n", 
+                           switch_dpids[i]);
+                }
+            }
+        }
+        
+        // Finally, install the last reverse flow at the source switch
+        struct switch_info *src_sw = find_switch_by_dpid(switch_dpids[0]);
+        if (src_sw) {
+            uint16_t rev_in_port = egress_ports[0];
+            uint16_t rev_out_port = ingress_ports[0];
+            
+            // Double check we're not creating a looping flow
+            if (rev_in_port != rev_out_port) {
+                log_msg(sw, "Installing final reverse flow at source switch %016" PRIx64 ": in_port=%d -> out_port=%d for src_mac=%02x:%02x:%02x:%02x:%02x:%02x\n", 
+                       switch_dpids[0], rev_in_port, rev_out_port,
+                       src_mac[0], src_mac[1], src_mac[2], src_mac[3], src_mac[4], src_mac[5]);
+                
+                install_flow(src_sw, rev_in_port, rev_out_port, 0xFFFFFFFF, src_entry);
+            } else {
+                log_msg(sw, "WARNING: Avoided installing looping reverse flow on source switch %016" PRIx64 "\n", 
+                       switch_dpids[0]);
+            }
+        }
+    }
     
     igraph_vector_int_destroy(&path);
 }
@@ -1420,6 +1755,41 @@ uint16_t find_port_to_next_hop(struct switch_info *sw, uint64_t src_dpid, uint64
     
 
     return OFPP_NONE;  /* not found */
+}
+
+struct switch_info *find_switch_by_dpid(uint64_t dpid) {
+    pthread_mutex_lock(&switches_lock);
+    for (int i = 0; i < MAX_SWITCHES; i++) {
+        if (switches[i].active && switches[i].datapath_id == dpid) {
+            pthread_mutex_unlock(&switches_lock);
+            return &switches[i];
+        }
+    }
+    pthread_mutex_unlock(&switches_lock);
+    return NULL;
+}
+
+uint16_t find_ingress_port(struct switch_info *sw, uint64_t dpid, uint64_t from_dpid) {
+    pthread_mutex_lock(&topology.lock);
+    for (igraph_integer_t i = 0; i < igraph_ecount(&topology.graph); i++) {
+        uint64_t src_dpid = (uint64_t)EAN(&topology.graph, "src_dpid", i);
+        uint64_t dst_dpid = (uint64_t)EAN(&topology.graph, "dst_dpid", i);
+        
+        if (src_dpid == from_dpid && dst_dpid == dpid) {
+            uint16_t port = (uint16_t)EAN(&topology.graph, "dst_port", i);
+            pthread_mutex_unlock(&topology.lock);
+            return port;
+        }
+        
+        if (dst_dpid == from_dpid && src_dpid == dpid) {
+            uint16_t port = (uint16_t)EAN(&topology.graph, "src_port", i);
+            pthread_mutex_unlock(&topology.lock);
+            return port;
+        }
+    }
+    pthread_mutex_unlock(&topology.lock);
+    
+    return 0;  /* not found */
 }
 
 void handle_broadcast_packet(struct switch_info *sw, struct ofp_packet_in *pi, struct mac_entry *src) {
@@ -1490,12 +1860,12 @@ void handle_broadcast_packet(struct switch_info *sw, struct ofp_packet_in *pi, s
 }
 
 bool is_port_in_mst(struct switch_info * sw, uint64_t dpid, uint16_t port_no, igraph_vector_int_t *mst_edges) {
-
     log_msg(sw, "Checking if port %d is in MST\n", port_no);
     igraph_integer_t num_edges = igraph_vector_int_size(mst_edges);
     
+    // Log MST size for debugging
+    log_msg(sw, "DEBUG: MST has %lld edges\n", num_edges);
     
-    // log_msg(sw, "MUTEX: Locking topology\n");
     pthread_mutex_lock(&topology.lock);
     for (igraph_integer_t i = 0; i < num_edges; i++) {
         igraph_integer_t edge_id = VECTOR(*mst_edges)[i];
@@ -1505,19 +1875,22 @@ bool is_port_in_mst(struct switch_info * sw, uint64_t dpid, uint16_t port_no, ig
         uint16_t src_port = (uint16_t)EAN(&topology.graph, "src_port", edge_id);
         uint16_t dst_port = (uint16_t)EAN(&topology.graph, "dst_port", edge_id);
         
+        // Enhanced logging
+        log_msg(sw, "DEBUG: Checking MST edge %lld: %016" PRIx64 ":%d -> %016" PRIx64 ":%d\n",
+                i, src_dpid, src_port, dst_dpid, dst_port);
+        
         if ((src_dpid == dpid && src_port == port_no) ||
             (dst_dpid == dpid && dst_port == port_no)) {
-
             pthread_mutex_unlock(&topology.lock);
-            // log_msg(sw, "MUTEX: Unlocked topology\n");
+            log_msg(sw, "DEBUG: Port %d on switch %016" PRIx64 " is in MST\n", 
+                   port_no, dpid);
             return true;
         }
     }
-
     pthread_mutex_unlock(&topology.lock);
-    // log_msg(sw, "MUTEX: Unlocked topology\n");
     
-
+    log_msg(sw, "DEBUG: Port %d on switch %016" PRIx64 " is NOT in MST\n", 
+            port_no, dpid);
     return false;
 }
 

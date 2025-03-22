@@ -14,7 +14,7 @@
 #include <signal.h>
 #include <pthread.h>
 #include <stdbool.h>
-#include </opt/homebrew/Cellar/igraph/0.10.15_1/include/igraph/igraph.h>
+#include </usr/include/igraph/igraph.h>
 #include "openflow.h"
 #include "uthash.h"
 
@@ -39,6 +39,8 @@
 #define ETH_DST_OFFSET 0
 #define ETH_SRC_OFFSET 6
 #define ETH_ETHERTYPE_OFFSET 12
+/* Add timeout constant */
+#define MAC_ENTRY_TIMEOUT 300  /* 5 minutes for MAC entry timeout */
 
 /* structure to track connected switches */
 struct switch_info {
@@ -86,6 +88,7 @@ struct mac_entry {
     uint16_t port_no;
     time_t last_seen;
     bool is_trunk; 
+    bool is_infrastructure;
     UT_hash_handle hh; /* makes this structure hashable */
 }; 
 
@@ -105,8 +108,12 @@ struct pending_message {
     void *data;
     size_t length;
     size_t sent;
+    time_t creation_time;  /* Add timestamp for timeout handling */
     struct pending_message *next;
 };
+
+/* Add timeout constant */
+#define MAC_ENTRY_TIMEOUT 300  /* 5 minutes for MAC entry timeout */
 
 /* structure to track installed flows */
 struct flow_entry {
@@ -126,6 +133,8 @@ extern int server_socket;
 extern volatile int running; /* for controller clean up and running */
 extern struct network_topology topology;
 extern struct dpid_to_vertex_map * dpids_to_vertex;
+extern struct mac_entry *mac_table;
+extern pthread_mutex_t mac_table_lock;
 
 
 /* function prototypes */
@@ -133,8 +142,9 @@ void signal_handler(int signum);
 void log_msg(struct switch_info * sw, const char *format, ...);
 void cleanup_switch(struct switch_info *sw);
 
-void add_or_update_mac(struct switch_info * sw, uint8_t *mac, uint64_t dpid, uint16_t port_no);
+void add_or_update_mac(struct switch_info * sw, uint8_t *mac, uint64_t dpid, uint16_t port_no, bool is_infrastructure);
 struct mac_entry *find_mac(uint8_t *mac);
+void remove_switch_mac_entries(uint64_t dpid);
 
 void add_or_update_dpid(uint64_t dpid, igraph_integer_t vertex_id);
 bool dpid_exists(uint64_t dpid);
@@ -177,12 +187,15 @@ void init_topology();
 void handle_switch_join(struct switch_info *sw);
 void handle_switch_disconnect(struct switch_info *sw); 
 void handle_port_change(struct switch_info *sw, uint16_t src_port_no, bool is_up); 
+void cleanup_topology();
 
 void add_or_update_link(uint64_t src_dpid, uint16_t src_port, uint64_t dst_dpid, uint16_t dst_port, struct switch_info * sw);
 void add_vertex(uint64_t dpid, struct switch_info * sw); 
 void remove_links_for_port(uint64_t dpid, uint16_t src_port_no, struct switch_info * sw);
 void remove_all_switch_links(uint64_t dpid, struct switch_info * sw);
 uint64_t vertex_to_dpid(igraph_integer_t vertex_id, struct switch_info * sw); 
+uint16_t find_ingress_port(struct switch_info *sw, uint64_t dpid, uint64_t from_dpid);
+struct switch_info *find_switch_by_dpid(uint64_t dpid);
 bool validate_path(uint64_t src_dpid, uint16_t src_port, 
                    uint64_t dst_dpid, uint16_t dst_port,
                    uint64_t *switch_dpids, uint16_t *ingress_ports, 

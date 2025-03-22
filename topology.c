@@ -16,7 +16,7 @@
 #include <stdbool.h>
 #include <sys/time.h>
 #include <time.h>
-#include </opt/homebrew/Cellar/igraph/0.10.15_1/include/igraph/igraph.h>
+#include </usr/include/igraph/igraph.h>
 #include "headers/uthash.h"
 #include "headers/controller.h"
 
@@ -96,6 +96,53 @@ void init_topology(){
 
 }
 
+/* function to clean up all topology resources */
+void cleanup_topology() {
+    struct dpid_to_vertex_map *current, *tmp;
+    
+    pthread_mutex_lock(&topology.lock);
+    
+    /* destroy the graph */
+    igraph_destroy(&topology.graph);
+    
+    /* clean up the DPID to vertex mapping */
+    HASH_ITER(hh, dpids_to_vertex, current, tmp) {
+        HASH_DEL(dpids_to_vertex, current);
+        free(current);
+    }
+    dpids_to_vertex = NULL;
+    
+    pthread_mutex_unlock(&topology.lock);
+    pthread_mutex_destroy(&topology.lock);
+}
+
+
+void remove_all_switch_links(uint64_t dpid, struct switch_info *sw) {
+    log_msg(sw, "Removing all links for switch %016" PRIx64 "\n", dpid);
+
+    pthread_mutex_lock(&topology.lock);
+    
+    igraph_vector_int_t edges_to_delete;
+    igraph_vector_int_init(&edges_to_delete, 0);
+    
+    /* collect all edges associated with this switch */
+    for (igraph_integer_t i = 0; i < igraph_ecount(&topology.graph); i++) {
+        uint64_t src_dpid = (uint64_t)EAN(&topology.graph, "src_dpid", i);
+        uint64_t dst_dpid = (uint64_t)EAN(&topology.graph, "dst_dpid", i);
+        
+        if (src_dpid == dpid || dst_dpid == dpid) {
+            igraph_vector_int_push_back(&edges_to_delete, i);
+        }
+    }
+    
+    /* selete edges in reverse order to avoid index shifting problems */
+    for (igraph_integer_t i = igraph_vector_int_size(&edges_to_delete) - 1; i >= 0; i--) {
+        igraph_delete_edges(&topology.graph, igraph_ess_1(VECTOR(edges_to_delete)[i]));
+    }
+    
+    igraph_vector_int_destroy(&edges_to_delete);
+    pthread_mutex_unlock(&topology.lock);
+}
 /* ------------------------------------------------- SWITCH EVENTS ------------------------------------------------- */
 
 /* funciton to handle a switch joining the graph, explore all connections */
@@ -118,7 +165,6 @@ void handle_switch_join(struct switch_info *sw) {
 
         /* the newest vertex id will be the length of the vertex vector minus 1*/
         vertex_id = igraph_vcount(&topology.graph) - 1;
-        add_or_update_dpid(sw->datapath_id, vertex_id);
     }
     log_msg(sw, "Vertex id: %lld\n", vertex_id);
 \
@@ -129,6 +175,27 @@ void handle_switch_join(struct switch_info *sw) {
         uint16_t port_no = ntohs(sw->ports[i].port_no);
         if (port_no < OFPP_MAX && !(ntohl(sw->ports[i].state) & OFPPS_LINK_DOWN)) {
             send_topology_discovery_packet(sw, port_no);
+        }
+    }
+
+    /* add all mac addresses to port from new switch */
+    for (int i = 0; i < sw->num_ports; i++) {
+        uint16_t port_no = ntohs(sw->ports[i].port_no);
+        
+        // Mark this MAC as belonging to switch infrastructure
+        struct mac_entry *entry = malloc(sizeof(struct mac_entry));
+        if (entry) {
+            memcpy(entry->mac, sw->ports[i].hw_addr, MAC_ADDR_LEN);
+            entry->switch_dpid = sw->datapath_id;
+            entry->port_no = port_no;
+            entry->last_seen = time(NULL);
+            entry->is_trunk = true;  // Consider all switch ports as trunk initially
+            entry->is_infrastructure = true;  // Mark as switch infrastructure
+            
+            // Add to MAC table with proper locking
+            pthread_mutex_lock(&mac_table_lock);
+            HASH_ADD(hh, mac_table, mac, MAC_ADDR_LEN, entry);
+            pthread_mutex_unlock(&mac_table_lock);
         }
     }
 }
@@ -190,22 +257,21 @@ void add_vertex(uint64_t dpid, struct switch_info * sw) {
     } 
 
     /* add new vertex - this creates a new UNIQUE vertex ID */
-    log_msg(sw, "Before adding vertex: graph has %lld vertices\n", igraph_vcount(&topology.graph));
     igraph_add_vertices(&topology.graph, 1, NULL);
-    log_msg(sw, "After adding vertex: graph has %lld vertices\n", igraph_vcount(&topology.graph));
+
     igraph_integer_t vertex_id = igraph_vcount(&topology.graph) - 1;
     
     /* print information for debugging */
-    log_msg(sw, "Created vertex ID %lld for switch %016" PRIx64 "\n", vertex_id, dpid);
+
     
     /* set attributes */
-    log_msg(sw, "Setting attributes\n");
+
     char dpid_str[20];
     snprintf(dpid_str, sizeof(dpid_str), "%" PRIu64, dpid);
     igraph_cattribute_VAS_set(&topology.graph, "dpid", vertex_id, dpid_str);
     
     /* add to the dpid -> vertex map, no mutex lock here */
-    log_msg(sw, "Adding or updating dpid\n");
+
     add_or_update_dpid(dpid, vertex_id); 
 
     pthread_mutex_unlock(&topology.lock);
@@ -220,8 +286,7 @@ void add_vertex(uint64_t dpid, struct switch_info * sw) {
 /* add or update a link in the topology */
 void add_or_update_link(uint64_t src_dpid, uint16_t src_port, uint64_t dst_dpid, uint16_t dst_port, struct switch_info * sw) {
 
-    log_msg(sw, "Adding or updating link for src_dpid %016" PRIx64 " with src_port %u and dst_dpid %016" PRIx64 " and dst_port %u\n", 
-       src_dpid, (unsigned int)src_port, dst_dpid, (unsigned int)dst_port);
+ 
 
     /* find or add source and destination vertices */
      
@@ -234,7 +299,7 @@ void add_or_update_link(uint64_t src_dpid, uint16_t src_port, uint64_t dst_dpid,
     }
     
     /* check if edge already exists */
-    log_msg(sw, "Getting edge id\n");
+
     igraph_integer_t edge_id;
     // log_msg(sw, "MUTEX: Locking topology\n");
     pthread_mutex_lock(&topology.lock);
@@ -253,8 +318,19 @@ void add_or_update_link(uint64_t src_dpid, uint16_t src_port, uint64_t dst_dpid,
     igraph_cattribute_EAN_set(&topology.graph, "dst_port", edge_id, dst_port);
     igraph_cattribute_EAN_set(&topology.graph, "last_seen", edge_id, time(NULL));
 
-    log_msg(sw, "DEBUG: Added/updated link %016" PRIx64 ":%d -> %016" PRIx64 ":%d (edge ID: %lld)\n",
-           src_dpid, src_port, dst_dpid, dst_port, edge_id);
+    /* NEW: Add a deterministic weight based on switch DPIDs for consistent path selection */
+    double weight = 1.0; // Default weight
+    
+    // If both switches have even or both have odd DPIDs, reduce weight slightly
+    // This creates a preference that's consistent regardless of direction
+    if ((src_dpid % 2 == 0 && dst_dpid % 2 == 0) || 
+        (src_dpid % 2 != 0 && dst_dpid % 2 != 0)) {
+        weight = 0.9;
+    }
+    
+    igraph_cattribute_EAN_set(&topology.graph, "weight", edge_id, weight);
+
+
            
     /* print all current edges for verification */
     log_msg(sw, "DEBUG: Current topology has %lld edges:\n", igraph_ecount(&topology.graph));
@@ -306,100 +382,8 @@ void remove_links_for_port(uint64_t dpid, uint16_t src_port_no, struct switch_in
 
 }
 
-/* a function to find all links in the graph with disconnected dpid */
-void remove_all_switch_links(uint64_t dpid, struct switch_info * sw){
-
-    log_msg(sw, "Removing all links for switch %016" PRIx64 "\n", dpid);
-
-    // log_msg(sw, "MUTEX: Locking topology\n");
-    pthread_mutex_lock(&topology.lock);
-    igraph_integer_t edges_to_remove[igraph_ecount(&topology.graph)];
-    int edges_marked_to_remove = 0;
-    igraph_integer_t i, total = igraph_ecount(&topology.graph);
-    for(i = 0; i < total; i++){ /* i is edge id */
-        igraph_real_t src = EAN(&topology.graph, "src_dpid", i);
-        igraph_real_t dst = EAN(&topology.graph, "dst_dpid", i);
-
-        /* any edge that contains the down switch, remove */
-        if((uint64_t)src == dpid || (uint64_t)dst == dpid){
-            edges_to_remove[edges_marked_to_remove++] = i;
-            
-        }
-    }
-
-    /* in case outer edges are moved down to fill lower ID, remove after processing */
-    for (i = 0; i < edges_marked_to_remove; i++) {
-        igraph_delete_edges(&topology.graph, igraph_ess_1(edges_to_remove[i]));
-    }
-
-    pthread_mutex_unlock(&topology.lock);
-    // log_msg(sw, "MUTEX: Unlocked topology\n");
 
 
-};
-
-bool validate_path(uint64_t src_dpid, uint16_t src_port, 
-                   uint64_t dst_dpid, uint16_t dst_port,
-                   uint64_t *switch_dpids, uint16_t *ingress_ports, 
-                   uint16_t *egress_ports, int num_hops, struct switch_info *sw) {
-    
-    /* validate source/destination ports aren't the same on the same switch */
-    if (src_dpid == dst_dpid && src_port == dst_port) {
-        log_msg(NULL, "ERROR: Path validation failed - same in/out port (%d) on switch %016" PRIx64 "\n", 
-                src_port, src_dpid);
-        return false;
-    }
-    
-    /* Validate first switch is source and last is destination */
-    if (switch_dpids[0] != src_dpid || switch_dpids[num_hops] != dst_dpid) {
-        log_msg(NULL, "ERROR: Path validation failed - endpoints don't match expected source/destination\n");
-        return false;
-    }
-    
-    // Check for loops in the path
-    for (int i = 0; i < num_hops; i++) {
-        // Validate that in_port != out_port for each switch (no hairpinning)
-        if (ingress_ports[i] == egress_ports[i]) {
-            log_msg(NULL, "ERROR: Path validation failed - switch %016" PRIx64 " has same in/out port\n", 
-                    switch_dpids[i]);
-            return false;
-        }
-        
-        // Check for repeated switches in path (except for the first and last)
-        for (int j = i+1; j < num_hops; j++) {
-            if (switch_dpids[i] == switch_dpids[j] && !(i == 0 && j == num_hops)) {
-                log_msg(NULL, "ERROR: Path validation failed - switch %016" PRIx64 " appears multiple times\n", 
-                        switch_dpids[i]);
-                return false;
-            }
-        }
-    }
-    
-    // Validate connectivity between adjacent switches
-
-    for (int i = 0; i < num_hops; i++) {
-        igraph_integer_t v1 = find_vertexid(sw, switch_dpids[i]);
-        igraph_integer_t v2 = find_vertexid(sw, switch_dpids[i+1]);
-        
-        if (v1 < 0 || v2 < 0) {
-
-            log_msg(NULL, "ERROR: Path validation failed - switch not found in topology\n");
-            return false;
-        }
-        
-        igraph_integer_t eid;
-        igraph_get_eid(&topology.graph, &eid, v1, v2, IGRAPH_ALL, 0);
-        if (eid < 0) {
-
-            log_msg(NULL, "ERROR: Path validation failed - no link between switches %016" PRIx64 " and %016" PRIx64 "\n", 
-                    switch_dpids[i], switch_dpids[i+1]);
-            return false;
-        }
-    }
-
-    
-    return true; // Path is valid
-}
 
 /* ----------------------------------------- TOPOLOGY DISCOVERY FUNCTIONS ------------------------------------------ */
 void send_topology_discovery_packet(struct switch_info *sw, uint16_t port_no) {
@@ -568,8 +552,10 @@ void handle_discovery_packet(struct switch_info *sw, struct ofp_packet_in *pi) {
     add_or_update_link(src_dpid, src_port, dst_dpid, dst_port, sw);
 }
 
-uint64_t vertex_to_dpid(igraph_integer_t vertex_id, struct switch_info * sw) {
+uint64_t vertex_to_dpid(igraph_integer_t vertex_id, struct switch_info *sw) {
     struct dpid_to_vertex_map *entry, *tmp;
+    bool found_match = false;
+    uint64_t result_dpid = (uint64_t)-1;
     
     log_msg(sw, "DEBUG: Finding dpid for vertex %lld\n", vertex_id);
     
@@ -577,12 +563,23 @@ uint64_t vertex_to_dpid(igraph_integer_t vertex_id, struct switch_info * sw) {
         if (entry->vertex_id == vertex_id) {
             log_msg(sw, "DEBUG: Found DPID %016" PRIx64 " for vertex %lld\n", 
                    entry->dpid, vertex_id);
-            return entry->dpid;
+            
+            // If we've already found a match, log a warning about duplicate mappings
+            if (found_match) {
+                log_msg(sw, "WARNING: Multiple DPIDs map to vertex ID %lld. Found %016" PRIx64 " and %016" PRIx64 "\n",
+                      vertex_id, result_dpid, entry->dpid);
+            }
+            
+            found_match = true;
+            result_dpid = entry->dpid;
         }
     }
     
-    log_msg(sw, "DEBUG: No DPID found for vertex %lld\n", vertex_id);
-    return (uint64_t)-1;  // Not found
+    if (!found_match) {
+        log_msg(sw, "DEBUG: No DPID found for vertex %lld\n", vertex_id);
+    }
+    
+    return result_dpid;
 }
 
 /* 
